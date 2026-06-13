@@ -1959,9 +1959,22 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
 
     def _strip_tool_suffix(s: str) -> str | None:
         lc = s.lower()
-        for suffix in ("_tool", "-tool", "tool"):
+        # ``_ide`` / ``-ide``: some IDE-hosted / kanban-worker models
+        # hallucinate an IDE-flavored suffix (mcp_terminal_ide,
+        # execute_code_ide). ``_tool`` family: Claude-style class names.
+        for suffix in ("_tool", "-tool", "tool", "_ide", "-ide"):
             if lc.endswith(suffix):
                 return s[: -len(suffix)].rstrip("_-")
+        return None
+
+    def _strip_mcp_prefix(s: str) -> str | None:
+        # Models also prepend an ``mcp_`` / ``mcp.`` / ``mcp-`` namespace
+        # (mcp_terminal_ide, mcp_read_file). Strip it so the core token
+        # (terminal, read_file) can resolve.
+        lc = s.lower()
+        for prefix in ("mcp_", "mcp.", "mcp-"):
+            if lc.startswith(prefix):
+                return s[len(prefix):].lstrip("_.-")
         return None
 
     # Cheap fast-paths first — these cover the common case.
@@ -1974,15 +1987,17 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
 
     # Build the full candidate set for class-like emissions.
     cands: set[str] = {tool_name, lowered, normalized, _camel_snake(tool_name)}
-    # Strip trailing tool-suffix up to twice — TodoTool_tool needs it.
-    for _ in range(2):
+    # Strip mcp_ prefix and tool/ide suffix — combos like
+    # ``mcp_terminal_ide`` (prefix+suffix) and ``mcp_read_file_ide_ide``
+    # (prefix+double suffix) need up to three reduction passes.
+    for _ in range(3):
         extra: set[str] = set()
         for c in cands:
-            stripped = _strip_tool_suffix(c)
-            if stripped:
-                extra.add(stripped)
-                extra.add(_norm(stripped))
-                extra.add(_camel_snake(stripped))
+            for stripped in (_strip_tool_suffix(c), _strip_mcp_prefix(c)):
+                if stripped:
+                    extra.add(stripped)
+                    extra.add(_norm(stripped))
+                    extra.add(_camel_snake(stripped))
         cands |= extra
 
     for c in cands:

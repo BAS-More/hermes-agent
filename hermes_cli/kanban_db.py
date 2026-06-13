@@ -1037,7 +1037,20 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- for tasks created from the CLI, dashboard, or any path that doesn't
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
-    session_id           TEXT
+    session_id           TEXT,
+    -- Build-level budget ceilings (the budget circuit breaker, distinct
+    -- from the consecutive-failure breaker above). Enforced on the ROOT
+    -- task of a build and applied to the whole parent->child subtree by
+    -- ``KanbanBudgetBreaker`` (hermes_cli/kanban_budget.py), checked by the
+    -- dispatcher BEFORE each spawn. NULL = no cap on that dimension.
+    --   wallclock_ceiling_seconds : max wall-clock since root.created_at.
+    --   max_build_iterations      : max task_runs across the build subtree.
+    -- budget_ceiling_usd / max_tokens are RESERVED for the USD fast-follow
+    -- (columns added now to avoid a second migration; unenforced today).
+    wallclock_ceiling_seconds INTEGER,
+    max_build_iterations      INTEGER,
+    budget_ceiling_usd        REAL,
+    max_tokens                INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1693,6 +1706,27 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    # Build-level budget breaker ceilings (see SCHEMA_SQL comment on the
+    # tasks table). Additive + nullable, so existing rows keep "no cap"
+    # behaviour. wallclock/iteration are enforced today; usd/tokens are
+    # reserved columns for the USD fast-follow (added now to avoid a second
+    # migration).
+    if "wallclock_ceiling_seconds" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "wallclock_ceiling_seconds",
+            "wallclock_ceiling_seconds INTEGER",
+        )
+    if "max_build_iterations" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "max_build_iterations", "max_build_iterations INTEGER"
+        )
+    if "budget_ceiling_usd" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "budget_ceiling_usd", "budget_ceiling_usd REAL"
+        )
+    if "max_tokens" not in cols:
+        _add_column_if_missing(conn, "tasks", "max_tokens", "max_tokens INTEGER")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2072,6 +2106,10 @@ def create_task(
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
+    wallclock_ceiling_seconds: Optional[int] = None,
+    max_build_iterations: Optional[int] = None,
+    budget_ceiling_usd: Optional[float] = None,
+    max_tokens: Optional[int] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2236,8 +2274,10 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        wallclock_ceiling_seconds, max_build_iterations,
+                        budget_ceiling_usd, max_tokens
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2259,6 +2299,10 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        int(wallclock_ceiling_seconds) if wallclock_ceiling_seconds is not None else None,
+                        int(max_build_iterations) if max_build_iterations is not None else None,
+                        float(budget_ceiling_usd) if budget_ceiling_usd is not None else None,
+                        int(max_tokens) if max_tokens is not None else None,
                     ),
                 )
                 for pid in parents:
@@ -4912,6 +4956,12 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    budget_blocked: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks whose build tripped the BUDGET breaker (kanban_budget.check),
+    as ``(task_id, reason)`` pairs. The build ROOT was blocked instead of
+    spawning. Reasons name the dimension: ``killswitch`` / ``wallclock`` /
+    ``iterations`` (usd/tokens reserved). Distinct from ``auto_blocked``
+    (the consecutive-failure breaker)."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -6267,6 +6317,38 @@ def dispatch_once(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
                     )
+            continue
+        # Budget circuit breaker (separate from the consecutive-failure
+        # breaker above): refuse to spawn when this task's BUILD has hit a
+        # wall-clock / iteration ceiling or the operator kill-switch is
+        # present. Read-only check; on a trip we block the build ROOT (so
+        # the whole build halts, not just this leaf) and skip the spawn.
+        # Fail-open: any error in the breaker must never wedge dispatch.
+        try:
+            from hermes_cli import kanban_budget  # local import: avoids cycle
+            _bud = kanban_budget.check(conn, row["id"], board=board)
+        except Exception:
+            _bud = {"tripped": False}
+        if _bud.get("tripped"):
+            _bud_root = _bud.get("root_id", row["id"])
+            _bud_reason = f"budget breaker: {_bud.get('reason') or 'tripped'}"
+            if not dry_run:
+                # Block the build root. ``block_task`` only acts on
+                # running/ready; if the root is in another status the block
+                # is a no-op but we always record the ``budget_exceeded``
+                # event so operators see why the build stalled.
+                block_task(conn, _bud_root, reason=_bud_reason)
+                with write_txn(conn):
+                    _append_event(
+                        conn, _bud_root, "budget_exceeded",
+                        {
+                            "reason": _bud_reason,
+                            "limit": _bud.get("limit"),
+                            "usage": _bud.get("usage"),
+                            "trigger_task": row["id"],
+                        },
+                    )
+            result.budget_blocked.append((row["id"], _bud_reason))
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
