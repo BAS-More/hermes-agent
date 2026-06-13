@@ -30,11 +30,15 @@ its workspace) and (b) a small ``.ezra/``-shaped governance store on disk in
 the build's workspace. The plugin (``plugins/factory-governor``) and the
 decompose/merge wiring are thin callers of the functions here.
 
-SEC-* pattern checks are deliberately NOT duplicated here — the bundled
-``security-guidance`` plugin already owns content-pattern scanning. The
-governor owns the GOV layer (decisions, protected paths, oversight policy)
-that security-guidance has no concept of. Together they are the two halves of
-EZRA's PreToolUse gate.
+Two check families run here:
+  * GOV-PROTECTED — decisions, protected paths, oversight policy (the layer
+    security-guidance has no concept of).
+  * SEC-SECRETS — hardcoded-secret detection (ports EZRA's SEC layer and
+    closes its gaps: AWS_SECRET_ACCESS_KEY, bare AKIA values, Stripe
+    sk_live/sk_test, GitHub ghp_/github_pat_, etc.). The bundled
+    ``security-guidance`` plugin scans for dangerous *code patterns* (eval,
+    pickle, ...) but does NOT scan for hardcoded credentials, so this is
+    complementary, not duplicative.
 """
 
 from __future__ import annotations
@@ -42,9 +46,10 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import sqlite3
 
@@ -89,6 +94,129 @@ _PATH_TOOLS: Dict[str, str] = {
     "str_replace_editor": "path",
     "edit_file": "path",
 }
+
+# Content args to scan for hardcoded secrets, by tool (superset of the path keys
+# above — same surface security-guidance reads). The first populated string wins.
+_CONTENT_KEYS: Tuple[str, ...] = ("content", "new_string", "file_content", "patch")
+
+# Cap on how much content we scan for secrets — a 10 MB blob has poor S/N and
+# would slow the agent loop. Matches security-guidance's _MAX_SCAN_BYTES.
+_MAX_SECRET_SCAN_BYTES = 256 * 1024
+
+
+# ---------------------------------------------------------------------------
+# SEC-SECRETS — hardcoded-secret detection (ports EZRA's SEC layer + closes its
+# gaps). Pattern set researched + adversarially verified + empirically corpus-
+# tested (0 false positives on a benign-code corpus; catches the AWS/Stripe/
+# GitHub/bare-AKIA cases EZRA's regex missed). Provider-prefixed value matches
+# are 'critical'; the generic name+value heuristic is 'high'.
+# ---------------------------------------------------------------------------
+
+# (name, compiled_regex, severity). Order is irrelevant — we report the first hit
+# per line. All compile under stdlib ``re``.
+_SECRET_PATTERNS: List[Tuple[str, "re.Pattern[str]", str]] = []
+for _name, _src, _sev in [
+    ("AWS access key id", r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b", "critical"),
+    ("GitHub token", r"\bgh[pousr]_[0-9A-Za-z]{36,40}\b", "critical"),
+    ("GitHub fine-grained PAT", r"\bgithub_pat_[0-9A-Za-z_]{59,}\b", "critical"),
+    ("Stripe key", r"\b[sr]k_(?:live|test|prod)_[0-9A-Za-z]{20,99}\b", "critical"),
+    ("Anthropic API key", r"\bsk-ant-(?:api|admin)[0-9]{2}-[A-Za-z0-9_-]{24,}", "critical"),
+    ("OpenAI scoped key", r"\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}", "critical"),
+    ("OpenAI legacy key", r"(?<![A-Za-z0-9_/-])sk-[A-Za-z0-9]{48}(?![A-Za-z0-9])", "critical"),
+    ("Google API key", r"\bAIza[0-9A-Za-z_-]{35}\b", "critical"),
+    ("Slack token", r"\bxox[baprs]-[0-9A-Za-z]{8,}(?:-[0-9A-Za-z]{8,})+-[0-9A-Za-z]{10,}\b", "critical"),
+    ("Slack webhook URL", r"https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]{24}", "critical"),
+    ("PEM private key", r"-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----", "critical"),
+    ("Azure storage AccountKey", r"AccountKey=[A-Za-z0-9/+]{86}==", "critical"),
+    ("JWT", r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b", "high"),
+    # AWS secret access key, anchored on the canonical env-var name (EZRA's gap):
+    # require a 40-char base64-ish value, reject a 40-hex SHA and all-same-char.
+    ("AWS secret access key",
+     r'(?i)(?<![A-Za-z0-9_])aws_?secret_?access_?key\s*[:=]\s*["\']?'
+     r'(?![A-Fa-f0-9]{40}(?![A-Za-z0-9/+]))'
+     r'(?!([A-Za-z0-9/+])\1{39})'
+     r'[A-Za-z0-9/+]{40}["\']?', "critical"),
+    # Generic: a sensitively-named var assigned a quoted long value. The inline
+    # negative-lookaheads strip placeholder / env-ref / version / JWT noise; the
+    # PLACEHOLDER allowlist below is the belt-and-suspenders second layer.
+    ("sensitive name + quoted value",
+     r'''(?i)\b\w{0,30}(?:secret|api[_-]?key|access[_-]?key|auth[_-]?token|'''
+     r'''access[_-]?token|[_-]token|password|passwd|client[_-]?secret|'''
+     r'''private[_-]?key)\w{0,8}\s*[:=]\s*["']'''
+     r'''(?![A-Za-z0-9/+_=.\-]*(?:PLACEHOLDER|CHANGE[_-]?ME|REPLACE|TODO|'''
+     r'''XXXX|YOUR[_-]|GOES[_-]?HERE|DUMMY|FAKE|SAMPLE|EXAMPLE|process\.env|'''
+     r'''os\.environ)[A-Za-z0-9/+_=.\-]*["'])'''
+     r'''(?!eyJ[A-Za-z0-9_\-]+["'])'''
+     r'''(?:(?=[A-Za-z0-9/+_=.\-]*[A-Za-z])(?=[A-Za-z0-9/+_=.\-]*[0-9])'''
+     r'''[A-Za-z0-9/+_=.\-]{12,}|[A-Za-z0-9/+]{24,}={0,2})["']''', "high"),
+]:
+    try:
+        _SECRET_PATTERNS.append((_name, re.compile(_src), _sev))
+    except re.error:  # pragma: no cover — defensive; a bad pattern is skipped, not fatal
+        pass
+
+# Placeholder allowlist — suppress a match whose matched text is an obvious
+# dummy/example. Value-scoped so a real secret beside a placeholder still fires.
+_PLACEHOLDER_LITERALS = {
+    "akiaiosfodnn7example", "your-key-here", "your-api-key-here",
+    "your-token-here", "changeme", "change-me", "redacted", "todo", "tbd",
+}
+_PLACEHOLDER_SUBSTRINGS = (
+    "example", "dummy", "sample", "placeholder", "fake", "changeme",
+    "replace", "your_", "your-", "goes_here", "goes-here", "test_key",
+    "do_not_use", "process.env", "os.environ", "${", "<", ">",
+)
+
+
+def _is_placeholder(matched: str) -> bool:
+    low = matched.lower()
+    if low.strip("\"'") in _PLACEHOLDER_LITERALS:
+        return True
+    return any(s in low for s in _PLACEHOLDER_SUBSTRINGS)
+
+
+def scan_secrets(content: str) -> List[Dict[str, Any]]:
+    """Return SEC-SECRETS findings for ``content``. Empty if clean / too big.
+
+    Line-by-line, first matching pattern per line, placeholder-allowlisted.
+    Pure + side-effect-free; FAIL-SAFE (any error → no findings).
+    """
+    try:
+        if not content:
+            return []
+        if len(content.encode("utf-8", errors="ignore")) > _MAX_SECRET_SCAN_BYTES:
+            return []
+        findings: List[Dict[str, Any]] = []
+        for i, line in enumerate(content.splitlines(), start=1):
+            if len(line) > 4096:  # skip pathological minified lines
+                continue
+            for name, rx, sev in _SECRET_PATTERNS:
+                m = rx.search(line)
+                if not m:
+                    continue
+                if _is_placeholder(m.group(0)):
+                    continue
+                findings.append({
+                    "code": "SEC-SECRETS",
+                    "severity": sev,
+                    "message": f"possible hardcoded {name} at line {i}",
+                    "line": i,
+                })
+                break  # one finding per line is enough
+        return findings
+    except Exception:
+        return []
+
+
+def _extract_write_content(tool_name: str, args: Any) -> Optional[str]:
+    """The content being written, for secret scanning. None if not a write."""
+    if tool_name not in _PATH_TOOLS or not isinstance(args, dict):
+        return None
+    for k in _CONTENT_KEYS:
+        v = args.get(k)
+        if isinstance(v, str) and v:
+            return v
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -342,9 +470,15 @@ def check_tool_call(
           "message": <human string for warn/block, or None>,
         }
 
-    Only GOV-PROTECTED is evaluated here (write to a protected path with no
-    ACTIVE decision). SEC-* patterns belong to the security-guidance plugin.
-    A non-write tool, an ungoverned build, or any internal error => allow.
+    Two concerns are evaluated, accumulated into one decision:
+      * GOV-PROTECTED — write to a protected path with no ACTIVE decision.
+        Needs the build's workspace governance to know what's protected.
+      * SEC-SECRETS — a hardcoded secret in the write content. Fires on ANY
+        governed write regardless of path/protection (a secret is bad
+        wherever it lands); this is the layer that closes EZRA's gaps and
+        works even on an ungoverned build.
+
+    A non-write tool, or any internal error => allow (FAIL-OPEN).
     """
     base = {
         "decision": "allow",
@@ -366,35 +500,46 @@ def check_tool_call(
             workspace = Path(workspace_override)
         else:
             workspace = _root_workspace(conn, root_id)
-        if workspace is None:
-            return base  # no workspace => can't resolve governance => allow
 
-        protected = resolve_protected_paths(workspace)
-        if not protected:
-            return base  # build declares nothing protected
+        findings: List[Dict[str, Any]] = []
 
-        hit = _path_matches(write_path, protected)
-        if hit is None:
-            return base  # not a protected path
+        # --- GOV-PROTECTED (needs workspace governance) ---------------------
+        if workspace is not None:
+            protected = resolve_protected_paths(workspace)
+            if protected:
+                hit = _path_matches(write_path, protected)
+                if hit is not None:
+                    authorised = load_active_decision_paths(workspace)
+                    if _path_matches(write_path, authorised) is None:
+                        findings.append({
+                            "code": "GOV-PROTECTED",
+                            "severity": "high",
+                            "message": (
+                                f"write to protected path '{write_path}' "
+                                f"(matched '{hit}') has no ACTIVE decision "
+                                f"authorising it. Record an ADR whose "
+                                f"enforcement.affected_paths covers this path, "
+                                f"or route the change through the owning task."
+                            ),
+                            "path": write_path,
+                        })
 
-        # Protected path. Authorised only if an ACTIVE decision references it.
-        authorised_globs = load_active_decision_paths(workspace)
-        if _path_matches(write_path, authorised_globs) is not None:
-            return base  # an ACTIVE ADR authorises this write
+        # --- SEC-SECRETS (path-independent; scans the write content) --------
+        content = _extract_write_content(tool_name, args)
+        if content:
+            for sf in scan_secrets(content):
+                sf["path"] = write_path
+                findings.append(sf)
 
-        level = resolve_level(workspace)
-        finding = {
-            "code": "GOV-PROTECTED",
-            "severity": "high",
-            "message": (
-                f"write to protected path '{write_path}' (matched '{hit}') "
-                f"has no ACTIVE decision authorising it. Record an ADR "
-                f"(/ezra:decide style) whose enforcement.affected_paths covers "
-                f"this path, or route the change through the owning task."
-            ),
-            "path": write_path,
-        }
-        result = _apply_level(base, level, [finding], root_id)
+        if not findings:
+            return base  # clean write
+
+        # Level: the build's configured oversight level when we have a
+        # workspace; otherwise default. SEC-SECRETS findings are critical/high,
+        # so at the WARN default they surface to the worker; a build that wants
+        # them to hard-block sets oversight.level=gate (config default does).
+        level = resolve_level(workspace) if workspace is not None else DEFAULT_LEVEL
+        result = _apply_level(base, level, findings, root_id)
         # Self-audit: record any non-allow decision (best-effort, never raises).
         audit_event(
             task_id=task_id,

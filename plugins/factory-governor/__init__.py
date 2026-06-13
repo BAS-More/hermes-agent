@@ -47,12 +47,21 @@ def _disabled() -> bool:
     }
 
 
-def _task_id_from_kwargs(kwargs: Dict[str, Any]) -> str:
-    """Extract the kanban task id the worker is executing.
+def _task_id(kwargs: Dict[str, Any]) -> str:
+    """Resolve the kanban task id the worker is executing.
 
-    ``get_pre_tool_call_block_message`` passes ``task_id`` (the worker's
-    ``effective_task_id``). Empty => not a kanban worker => no governance.
+    The dispatcher pins ``HERMES_KANBAN_TASK`` in every worker's environment
+    (kanban_db._default_spawn), which is the authoritative, reliable signal
+    that this process is a kanban worker and which build it's on. We prefer it
+    over the hook's ``task_id`` kwarg (the agent's ``effective_task_id``, which
+    is only the kanban id in some invocation paths and a random per-turn UUID
+    in others). Falling back to the kwarg keeps the gate working if a future
+    caller passes a real kanban id without the env. Empty => not a kanban
+    worker => governance is a silent no-op.
     """
+    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    if isinstance(env_tid, str) and env_tid:
+        return env_tid
     tid = kwargs.get("task_id")
     return tid if isinstance(tid, str) and tid else ""
 
@@ -88,7 +97,7 @@ def _on_pre_tool_call(
     ``transform_tool_result`` instead (the write proceeds, the model sees the
     warning next turn) — exactly security-guidance's warn-mode contract.
     """
-    res = _evaluate(tool_name, args, _task_id_from_kwargs(kwargs))
+    res = _evaluate(tool_name, args, _task_id(kwargs))
     if not res or res.get("decision") != "block":
         return None
     return {
@@ -112,7 +121,7 @@ def _on_transform_tool_result(
     is no result to decorate) — mirror security-guidance and do nothing here
     for them. Returning None leaves the result untouched.
     """
-    res = _evaluate(tool_name, args, _task_id_from_kwargs(kwargs))
+    res = _evaluate(tool_name, args, _task_id(kwargs))
     if not res:
         return None
     if res.get("decision") != "warn":
