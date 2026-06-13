@@ -155,6 +155,116 @@ for _name, _src, _sev in [
     except re.error:  # pragma: no cover — defensive; a bad pattern is skipped, not fatal
         pass
 
+# Additional distinctively-prefixed vendor keys (low FP risk — vendor-owned
+# namespaces). Appended to the same critical-severity scan.
+for _name, _src in [
+    ("GitLab PAT", r"\bglpat-[0-9A-Za-z_-]{20,}\b"),
+    ("SendGrid key", r"\bSG\.[0-9A-Za-z_-]{16,}\.[0-9A-Za-z_-]{16,}\b"),
+    ("npm token", r"\bnpm_[0-9A-Za-z]{36,40}\b"),
+    ("HuggingFace token", r"\bhf_[0-9A-Za-z]{30,}\b"),
+    ("Twilio API key SID", r"\bSK[0-9a-fA-F]{32}\b"),
+    ("Telegram bot token", r"\b\d{8,10}:[A-Za-z0-9_-]{35,}\b"),
+    ("Square access token", r"\bsq0(?:atp|csp)-[0-9A-Za-z_-]{22,}\b"),
+    ("Google OAuth token", r"\bya29\.[0-9A-Za-z_-]{20,}\b"),
+]:
+    try:
+        _SECRET_PATTERNS.append((_name, re.compile(_src), "critical"))
+    except re.error:  # pragma: no cover
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Entropy fallback — catches UNPREFIXED high-entropy secrets that no vendor
+# pattern covers (e.g. `api_key = "<40 random hex/base64>"`). Method validated
+# against gitleaks/detect-secrets/trufflehog research + empirically tuned: the
+# STRUCTURAL EXCLUSIONS do the real work (entropy alone can't tell a git SHA
+# from a hex secret — both ~3.9 bits/char), entropy is the last coarse filter.
+# Precision-favouring (FP at a write gate is worse than a miss): requires a
+# quoted value assigned to a secret-keyword-bearing name, applies SHA/UUID/SRI/
+# media/placeholder exclusions, then a per-charset entropy floor. Severity is
+# MEDIUM (warn-at-gate, not hard block) — entropy is fuzzier than a prefix.
+# ---------------------------------------------------------------------------
+
+_ENT_HEX_THRESHOLD = 3.3    # detect-secrets default 3.0; raised for the gate
+_ENT_B64_THRESHOLD = 4.5    # detect-secrets/trufflehog default
+_ENT_MIN_HEX = 32
+_ENT_MIN_B64 = 24
+_ENT_MAX_LEN = 200          # above this is almost always media/blob, not a key
+_HEXCHARS = set("0123456789abcdefABCDEF")
+
+# Quoted value (16-200 chars) assigned via = / := / : to a named LHS.
+_ENT_ASSIGN = re.compile(r"""([A-Za-z_][A-Za-z0-9_]{0,40})\s*[:=]+\s*["']([^"']{16,200})["']""")
+# Strong secret keyword in the LHS name — also overrides the SHA exclusion
+# (a var literally named api_key/secret holding 40 hex is a key, not a commit).
+_ENT_STRONG_NAME = re.compile(r"(?i)(?:secret|api[_-]?key|apikey|token|passw|private[_-]?key|access[_-]?key|auth)")
+# Structural exclusions — if the value matches any, it is NOT a secret.
+_ENT_SHA = re.compile(r"^[0-9a-f]{7}$|^[0-9a-f]{40}$|^[0-9a-f]{64}$|^[0-9a-f]{128}$")
+_ENT_UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_ENT_SRI = re.compile(r"^(?:sha256|sha384|sha512)-")
+_ENT_MEDIA = re.compile(r"^(?:iVBOR|/9j/|R0lGOD|JVBER|d09GR|data:)")
+_ENT_RUN = re.compile(r"^(.)\1{7,}$")
+_ENT_B64CHARSET = re.compile(r"^[A-Za-z0-9+/=_-]+$")
+_ENT_PLACEHOLDER = (
+    "example", "dummy", "sample", "placeholder", "fake", "changeme",
+    "replace", "your_", "your-", "goes_here", "goes-here", "deadbeef",
+    "cafebabe", "foobar", "lorem", "xxxx", "0000",
+)
+
+
+def _shannon(s: str) -> float:
+    if not s:
+        return 0.0
+    import math
+    h = 0.0
+    for ch in set(s):
+        p = s.count(ch) / len(s)
+        h -= p * math.log2(p)
+    return h
+
+
+def _entropy_findings(line: str) -> List[Dict[str, Any]]:
+    """Entropy-based detection for one line. Returns at most one finding.
+
+    Precision-favouring pipeline: assignment+keyword context -> placeholder ->
+    structural exclusions -> charset split -> entropy floor.
+    """
+    out: List[Dict[str, Any]] = []
+    for m in _ENT_ASSIGN.finditer(line):
+        name, val = m.group(1), m.group(2)
+        if not _ENT_STRONG_NAME.search(name):
+            # Also accept a keyword appearing before the assignment on the line.
+            if not _ENT_STRONG_NAME.search(line[:m.start()]):
+                continue
+        low = val.lower()
+        if any(s in low for s in _ENT_PLACEHOLDER):
+            continue
+        strong = _ENT_STRONG_NAME.search(name) is not None
+        # SHA exclusion is conditional on the name not being a strong keyword.
+        if _ENT_SHA.match(val) and not strong:
+            continue
+        if (_ENT_UUID.match(val) or _ENT_SRI.match(val)
+                or _ENT_MEDIA.match(val) or _ENT_RUN.match(val)):
+            continue
+        if val.isdigit() or len(val) > _ENT_MAX_LEN:
+            continue
+        is_hex = all(c in _HEXCHARS for c in val)
+        if is_hex:
+            if len(val) < _ENT_MIN_HEX:
+                continue
+            if _shannon(val) >= _ENT_HEX_THRESHOLD:
+                out.append({"code": "SEC-SECRETS", "severity": "medium",
+                            "message": f"possible hardcoded secret (high-entropy hex assigned to '{name}')"})
+                return out
+        else:
+            if len(val) < _ENT_MIN_B64 or not _ENT_B64CHARSET.match(val):
+                continue
+            if _shannon(val) >= _ENT_B64_THRESHOLD:
+                out.append({"code": "SEC-SECRETS", "severity": "medium",
+                            "message": f"possible hardcoded secret (high-entropy value assigned to '{name}')"})
+                return out
+    return out
+
+
 # Placeholder allowlist — suppress a match whose matched text is an obvious
 # dummy/example. Value-scoped so a real secret beside a placeholder still fires.
 _PLACEHOLDER_LITERALS = {
@@ -190,6 +300,7 @@ def scan_secrets(content: str) -> List[Dict[str, Any]]:
         for i, line in enumerate(content.splitlines(), start=1):
             if len(line) > 4096:  # skip pathological minified lines
                 continue
+            matched = False
             for name, rx, sev in _SECRET_PATTERNS:
                 m = rx.search(line)
                 if not m:
@@ -202,7 +313,14 @@ def scan_secrets(content: str) -> List[Dict[str, Any]]:
                     "message": f"possible hardcoded {name} at line {i}",
                     "line": i,
                 })
+                matched = True
                 break  # one finding per line is enough
+            # Entropy fallback only if no explicit provider/generic pattern hit
+            # this line (avoids double-reporting the same secret).
+            if not matched:
+                for ef in _entropy_findings(line):
+                    ef["line"] = i
+                    findings.append(ef)
         return findings
     except Exception:
         return []
