@@ -355,6 +355,30 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
                                "Ignored without --goal.")
+    p_create.add_argument("--max-runtime-build", default=None,
+                          dest="max_runtime_build",
+                          help="BUILD-level wall-clock ceiling (budget circuit "
+                               "breaker), distinct from --max-runtime (per "
+                               "worker). Accepts seconds or durations (30m, 2h). "
+                               "When the whole build exceeds this since the root "
+                               "was created, the dispatcher BLOCKS the build root "
+                               "instead of spawning more workers. Set on the root "
+                               "card. Omit for no cap.")
+    p_create.add_argument("--max-iterations", type=int, default=None,
+                          metavar="N", dest="max_build_iterations",
+                          help="BUILD-level iteration ceiling (budget circuit "
+                               "breaker): max total worker runs across the build "
+                               "subtree before the dispatcher blocks the root. "
+                               "Guards runaway autonomous loops. Omit for no cap.")
+    p_create.add_argument("--budget-usd", type=float, default=None,
+                          metavar="USD", dest="budget_ceiling_usd",
+                          help="BUILD-level USD ceiling (RESERVED — accepted now "
+                               "but inert until per-run cost capture lands; "
+                               "the column is stored for the fast-follow).")
+    p_create.add_argument("--max-tokens", type=int, default=None,
+                          metavar="N", dest="max_tokens",
+                          help="BUILD-level token ceiling (RESERVED — accepted "
+                               "now but inert until per-run token capture lands).")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -1325,6 +1349,18 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # Build-level budget breaker ceilings (set on the root card).
+    try:
+        max_runtime_build = _parse_duration(getattr(args, "max_runtime_build", None))
+    except ValueError as exc:
+        print(f"kanban: --max-runtime-build: {exc}", file=sys.stderr)
+        return 2
+    max_build_iterations = getattr(args, "max_build_iterations", None)
+    if max_build_iterations is not None and max_build_iterations < 1:
+        print("kanban: --max-iterations must be >= 1", file=sys.stderr)
+        return 2
+    budget_ceiling_usd = getattr(args, "budget_ceiling_usd", None)
+    max_tokens = getattr(args, "max_tokens", None)
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1346,6 +1382,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            wallclock_ceiling_seconds=max_runtime_build,
+            max_build_iterations=max_build_iterations,
+            budget_ceiling_usd=budget_ceiling_usd,
+            max_tokens=max_tokens,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
