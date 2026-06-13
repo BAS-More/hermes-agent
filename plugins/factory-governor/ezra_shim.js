@@ -92,9 +92,17 @@ function resolveEzraHook() {
 // Resolve the dir EZRA should treat as the project root (must contain .ezra/).
 // Priority: $EZRA_PROJECT_DIR (set by the wiring to the build root workspace
 // the native governor seeds) -> $HERMES_KANBAN_WORKSPACE -> payload cwd.
+// Default factory EZRA settings dir (fully /ezra:init-ed; in the backed-up
+// hermes-factory-tooling repo). Used when $EZRA_PROJECT_DIR is unset so the
+// Hybrid works with zero env dependency — the worker .env isn't backed up, so
+// relying on it would silently disable the chain after a profile restore.
+const DEFAULT_EZRA_SETTINGS_DIR =
+  'C:\\Dev\\tools\\hermes-update-safety\\factory-ezra-settings';
+
 function resolveProjectDir(payloadCwd) {
   const candidates = [
     process.env.EZRA_PROJECT_DIR,
+    DEFAULT_EZRA_SETTINGS_DIR,
     process.env.HERMES_KANBAN_WORKSPACE,
     payloadCwd,
   ];
