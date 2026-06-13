@@ -459,9 +459,55 @@ def decompose_task(
             task_id, False, "task moved out of triage before decomposition",
         )
 
+    # ---- orchestrator-as-governor: seed the build's governance -------------
+    # Best-effort + fail-open. At fan-out the orchestrator records the
+    # governance the whole build runs under (EZRA model). This writes a
+    # per-build ``.ezra/governance.yaml`` once the root workspace is known; if
+    # the workspace isn't resolved yet (lazy at spawn), the config-level
+    # ``kanban.governance`` default still governs every worker, so skipping
+    # here never leaves a build ungoverned. Never breaks decomposition.
+    try:
+        _seed_build_governance(task_id, cfg)
+    except Exception:
+        logger.debug("decompose: governance seed skipped for %s", task_id, exc_info=True)
+
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children",
         fanout=True, child_ids=child_ids,
+    )
+
+
+def _seed_build_governance(root_id: str, cfg: dict) -> None:
+    """Write the build root's ``.ezra/governance.yaml`` from the config-level
+    default, so the build carries an explicit, auditable governance record.
+
+    Pulls defaults from ``kanban.governance`` in config (protected_paths,
+    oversight.level, decisions) and stamps them onto the root workspace. If the
+    workspace path isn't set yet, this is a no-op (the config default still
+    applies at gate time). Fully best-effort.
+    """
+    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    gov_default = kanban_cfg.get("governance")
+    if not isinstance(gov_default, dict) or not gov_default:
+        return  # nothing configured to seed; config-default path handles it
+    try:
+        from hermes_cli import kanban_govern
+    except Exception:
+        return
+    from pathlib import Path
+    with kb.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT workspace_path FROM tasks WHERE id = ?", (root_id,)
+        ).fetchone()
+    wp = (row["workspace_path"] if row is not None else None)
+    if not wp:
+        return  # workspace resolved lazily at spawn; config default still governs
+    level = (gov_default.get("oversight", {}) or {}).get("level")
+    kanban_govern.seed_governance(
+        Path(wp),
+        protected_paths=list(gov_default.get("protected_paths", []) or []),
+        oversight_level=level,
+        decisions=list(gov_default.get("decisions", []) or []),
     )
 
 

@@ -1,0 +1,8 @@
+name: factory-governor
+version: "0.1.0"
+description: "Orchestrator-as-EZRA governance gate for the kanban dev factory. On file-write tool calls inside a kanban worker, enforces the EZRA GOV-PROTECTED rule (a write to a protected path requires an ACTIVE decision/ADR in the build's .ezra/governance) under a per-build oversight dial (monitor/warn/gate/strict, default warn). Read-first, fail-open: any error allows the write so governance never wedges a worker. SEC-* content patterns are owned by the separate security-guidance plugin; this is the GOV layer. Logic lives in hermes_cli.kanban_govern."
+author: "BAS-More (Hermes factory governor; EZRA model ported from BAS-More/ezra-claude-code)"
+kind: standalone
+hooks:
+  - pre_tool_call
+  - transform_tool_result
