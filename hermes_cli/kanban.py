@@ -868,6 +868,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
 
+    # --- govern (factory governance: level, protected paths, secrets, budget) ---
+    try:
+        from hermes_cli import kanban_govern_cmd
+        kanban_govern_cmd.register(sub)
+    except Exception:  # pragma: no cover — never break the parser on an optional cmd
+        pass
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -983,6 +990,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
+            "govern":   _cmd_govern,
         }
         handler = handlers.get(action)
         if not handler:
@@ -998,6 +1006,12 @@ def kanban_command(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
+
+def _cmd_govern(args: argparse.Namespace) -> int:
+    """Dispatch ``hermes kanban govern …`` to the govern command module."""
+    from hermes_cli import kanban_govern_cmd
+    return kanban_govern_cmd.cmd_govern(args)
+
 
 def _profile_author() -> str:
     """Best-effort author name for an interactive CLI call."""
