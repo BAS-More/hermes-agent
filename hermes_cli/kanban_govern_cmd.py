@@ -916,6 +916,10 @@ def cmd_govern(args: argparse.Namespace) -> int:
                 results.append(_set_orchestration(key, val))
         if getattr(args, "auto_decompose", None) is not None:
             results.append(_set_orchestration("auto_decompose", args.auto_decompose == "on"))
+        if getattr(args, "auto_decompose_per_tick", None) is not None:
+            results.append(_set_orchestration("auto_decompose_per_tick", int(args.auto_decompose_per_tick)))
+        if getattr(args, "max_in_progress", None) is not None:
+            results.append(_set_orchestration("max_in_progress_per_profile", int(args.max_in_progress)))
         if getattr(args, "default_max_iterations", None) is not None:
             results.append(_set_budget_default("default_max_iterations", args.default_max_iterations))
         if getattr(args, "default_wallclock", None) is not None:
@@ -994,6 +998,8 @@ def register(subparsers) -> None:
     pset.add_argument("--orchestrator-profile", dest="orchestrator_profile", help="Set kanban.orchestrator_profile (root config)")
     pset.add_argument("--default-assignee", dest="default_assignee", help="Set kanban.default_assignee (root config)")
     pset.add_argument("--auto-decompose", dest="auto_decompose", choices=["on", "off"], help="Toggle auto-decompose")
+    pset.add_argument("--auto-decompose-per-tick", dest="auto_decompose_per_tick", type=int, help="Max triage tasks decomposed per dispatch tick")
+    pset.add_argument("--max-in-progress", dest="max_in_progress", type=int, help="Max in-progress tasks per profile")
     pset.add_argument("--default-max-iterations", dest="default_max_iterations", type=int, help="Default build iteration ceiling for new cards (0=unlimited)")
     pset.add_argument("--default-wallclock", dest="default_wallclock", type=int, help="Default build wall-clock ceiling (seconds) for new cards (0=unlimited)")
 
