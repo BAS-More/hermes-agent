@@ -65,6 +65,10 @@ Output a single JSON object with this exact shape:
   {
     "fanout": true,
     "rationale": "<one sentence on why this decomposition>",
+    "acceptance": [
+      "<a concrete, checkable 'done when…' criterion for the WHOLE build>",
+      "<another criterion — what the assembled result must satisfy>"
+    ],
     "tasks": [
       {
         "title": "<concrete task title, imperative voice, <= 80 chars>",
@@ -77,6 +81,13 @@ Output a single JSON object with this exact shape:
   }
 
 Rules:
+  - "acceptance" is the list of concrete, verifiable success criteria for the
+    ENTIRE build (not per-task) — the "results that must be achieved". Derive
+    them from the original task. Each must be objectively checkable by reviewing
+    the finished work (e.g. "the API returns 200 with a JWT on valid login",
+    "all new code has tests and they pass", not "works well"). 2-6 criteria.
+    An orchestrator will later verify the assembled result against these and
+    command corrective work until they are all met.
   - "parents" is a list of INDICES (0-based) into this same "tasks" list,
     expressing actual data dependencies. Tasks with no parents run in
     PARALLEL. Tasks with parents wait until every parent completes.
@@ -470,6 +481,20 @@ def decompose_task(
         _seed_build_governance(task_id, cfg)
     except Exception:
         logger.debug("decompose: governance seed skipped for %s", task_id, exc_info=True)
+
+    # Record the build's acceptance criteria (the "results to achieve") so the
+    # orchestrator closed-loop can later verify the assembled result against
+    # them. Best-effort; only meaningful when the loop is enabled, but harmless
+    # to record always. The criteria came from the decomposer LLM output.
+    try:
+        acceptance = parsed.get("acceptance")
+        if isinstance(acceptance, list) and acceptance:
+            from hermes_cli import kanban_govern
+            kanban_govern.record_acceptance(
+                task_id, [str(a) for a in acceptance if a]
+            )
+    except Exception:
+        logger.debug("decompose: acceptance record skipped for %s", task_id, exc_info=True)
 
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children",

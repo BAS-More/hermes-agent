@@ -396,6 +396,65 @@ def _recent_builds(limit: int = 25) -> List[Dict[str, Any]]:
     return []
 
 
+def _active_builds(board: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    """The orchestrator closed-loop view: every build with a recorded state
+    (acceptance criteria + verify round + last verdict), joined with the root
+    task's live status/title. Feeds the dashboard's "Builds" pane.
+
+    Only meaningful when the loop is enabled, but harmless to surface always.
+    Fully fail-soft."""
+    try:
+        from hermes_cli import kanban_govern
+        from hermes_cli.kanban_db import kanban_home
+        state_dir = kanban_home() / "build-state"
+    except Exception:
+        return []
+    if not state_dir.exists():
+        return []
+    builds: List[Dict[str, Any]] = []
+    try:
+        files = sorted(state_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except Exception:
+        files = list(state_dir.glob("*.json"))
+    # Resolve live task fields in one connection.
+    rows: Dict[str, Dict[str, Any]] = {}
+    try:
+        import hermes_cli.kanban_db as kb
+        with kb.connect_closing(board=board) as conn:
+            for f in files[:limit]:
+                rid = f.stem
+                r = conn.execute(
+                    "SELECT title, status, assignee FROM tasks WHERE id = ?", (rid,)
+                ).fetchone()
+                if r is not None:
+                    rows[rid] = {"title": r["title"], "status": r["status"],
+                                 "assignee": r["assignee"]}
+    except Exception:
+        rows = {}
+    for f in files[:limit]:
+        try:
+            st = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        rid = st.get("root_id") or f.stem
+        live = rows.get(rid, {})
+        builds.append({
+            "root_id": rid,
+            "title": live.get("title"),
+            "task_status": live.get("status"),
+            "orchestrator": live.get("assignee"),
+            "loop_state": st.get("loop_state"),
+            "verify_round": st.get("verify_round", 0),
+            "max_verify_rounds": kanban_govern.max_verify_rounds(),
+            "acceptance": st.get("acceptance", []),
+            "last_verdict": st.get("last_verdict"),
+            "last_summary": st.get("last_summary"),
+            "unmet": st.get("unmet", []),
+            "updated_at": st.get("_updated_at"),
+        })
+    return builds
+
+
 def _orchestration_config() -> Dict[str, Any]:
     """The kanban orchestration knobs (orchestrator_profile, default_assignee, ...)."""
     try:
@@ -409,6 +468,8 @@ def _orchestration_config() -> Dict[str, Any]:
             "max_in_progress_per_profile": kb.get("max_in_progress_per_profile"),
             "dispatch_in_gateway": kb.get("dispatch_in_gateway"),
             "failure_limit": kb.get("failure_limit"),
+            "orchestrator_loop": bool(kb.get("orchestrator_loop")),
+            "max_verify_rounds": kb.get("max_verify_rounds") or 3,
         }
     except Exception:
         return {}
@@ -454,6 +515,7 @@ def build_status(board: Optional[str] = None) -> Dict[str, Any]:
         },
         "budget": _budget_status(board),
         "orchestration": _orchestration_config(),
+        "builds": _active_builds(board),
         "activity": {
             "recent_governance_blocks": _recent_audit(),
             "recent_budget_events": _recent_budget_events(board),
@@ -710,7 +772,16 @@ def _set_orchestration(key: str, value: Any) -> Dict[str, Any]:
         return {"ok": False, "error": "root config.yaml not found"}
     try:
         text = cp.read_text(encoding="utf-8")
-        yv = value if isinstance(value, str) else ("true" if value else "false")
+        # YAML scalar: strings verbatim, bool -> true/false, int -> the number.
+        # Order matters — bool is a subclass of int, so test bool FIRST.
+        if isinstance(value, str):
+            yv = value
+        elif isinstance(value, bool):
+            yv = "true" if value else "false"
+        elif isinstance(value, int):
+            yv = str(value)
+        else:
+            yv = "true" if value else "false"
         new = _set_path(text, ["kanban", key], yv)
         ok = new is not None and _save_text(cp, new)
         return {"ok": ok, "key": key, "value": value, "path": str(cp)}
@@ -920,6 +991,10 @@ def cmd_govern(args: argparse.Namespace) -> int:
             results.append(_set_orchestration("auto_decompose_per_tick", int(args.auto_decompose_per_tick)))
         if getattr(args, "max_in_progress", None) is not None:
             results.append(_set_orchestration("max_in_progress_per_profile", int(args.max_in_progress)))
+        if getattr(args, "orchestrator_loop", None) is not None:
+            results.append(_set_orchestration("orchestrator_loop", args.orchestrator_loop == "on"))
+        if getattr(args, "max_verify_rounds", None) is not None:
+            results.append(_set_orchestration("max_verify_rounds", int(args.max_verify_rounds)))
         if getattr(args, "default_max_iterations", None) is not None:
             results.append(_set_budget_default("default_max_iterations", args.default_max_iterations))
         if getattr(args, "default_wallclock", None) is not None:
@@ -1000,6 +1075,8 @@ def register(subparsers) -> None:
     pset.add_argument("--auto-decompose", dest="auto_decompose", choices=["on", "off"], help="Toggle auto-decompose")
     pset.add_argument("--auto-decompose-per-tick", dest="auto_decompose_per_tick", type=int, help="Max triage tasks decomposed per dispatch tick")
     pset.add_argument("--max-in-progress", dest="max_in_progress", type=int, help="Max in-progress tasks per profile")
+    pset.add_argument("--orchestrator-loop", dest="orchestrator_loop", choices=["on", "off"], help="Toggle the orchestrator closed-loop (verify assembled build vs acceptance, command corrections)")
+    pset.add_argument("--max-verify-rounds", dest="max_verify_rounds", type=int, help="Max verify→correct→re-verify rounds before escalating to a human (default 3)")
     pset.add_argument("--default-max-iterations", dest="default_max_iterations", type=int, help="Default build iteration ceiling for new cards (0=unlimited)")
     pset.add_argument("--default-wallclock", dest="default_wallclock", type=int, help="Default build wall-clock ceiling (seconds) for new cards (0=unlimited)")
 

@@ -1002,3 +1002,79 @@ def _recent_block_count(task_id: str, code: str, window: int = 50) -> int:
         return n
     except Exception:
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Build state — the orchestrator closed-loop record (acceptance criteria +
+# verify-round counter + last verdict). Keyed by the build ROOT id, stored at
+# <kanban_home>/build-state/<root_id>.json so it's available even before the
+# root workspace resolves (workspace is lazy at spawn). Best-effort + fail-soft.
+# ---------------------------------------------------------------------------
+
+MAX_VERIFY_ROUNDS_DEFAULT = 3
+
+
+def _build_state_path(root_id: str) -> Optional[Path]:
+    if not root_id:
+        return None
+    try:
+        from hermes_cli.kanban_db import kanban_home
+        return kanban_home() / "build-state" / f"{root_id}.json"
+    except Exception:
+        return None
+
+
+def load_build_state(root_id: str) -> Dict[str, Any]:
+    p = _build_state_path(root_id)
+    if p is None or not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_build_state(root_id: str, **updates: Any) -> Dict[str, Any]:
+    """Merge ``updates`` into the build's state record. Returns the merged
+    state. Never raises."""
+    p = _build_state_path(root_id)
+    if p is None:
+        return {}
+    try:
+        cur = load_build_state(root_id)
+        cur.update({k: v for k, v in updates.items() if v is not None})
+        cur["root_id"] = root_id
+        cur["_updated_at"] = _now_iso()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
+        return cur
+    except Exception:
+        return {}
+
+
+def record_acceptance(root_id: str, acceptance: List[str]) -> None:
+    """Record the build's acceptance criteria at decompose time."""
+    if not acceptance:
+        return
+    save_build_state(root_id, acceptance=list(acceptance), verify_round=0,
+                     loop_state="building")
+
+
+def orchestrator_loop_enabled() -> bool:
+    """Whether the closed-loop is on (kanban.orchestrator_loop, default OFF)."""
+    try:
+        from hermes_cli.config import load_config
+        kb = (load_config().get("kanban") or {})
+        return bool(kb.get("orchestrator_loop"))
+    except Exception:
+        return False
+
+
+def max_verify_rounds() -> int:
+    try:
+        from hermes_cli.config import load_config
+        kb = (load_config().get("kanban") or {})
+        v = kb.get("max_verify_rounds")
+        return int(v) if v else MAX_VERIFY_ROUNDS_DEFAULT
+    except Exception:
+        return MAX_VERIFY_ROUNDS_DEFAULT

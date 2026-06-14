@@ -3018,6 +3018,16 @@ def recompute_ready(
                         (task_id,),
                     )
                 else:
+                    # ORCHESTRATOR CLOSED-LOOP (flag-gated, OFF by default):
+                    # if this task is a build ROOT (it has children — it was a
+                    # parent of them) AND the loop is enabled AND it has
+                    # recorded acceptance criteria, divert it to 'review' so the
+                    # orchestrator verifies the ASSEMBLED result against the goal
+                    # and commands corrective work, instead of promoting straight
+                    # to 'ready'/done. Otherwise: unchanged classic promotion.
+                    if _maybe_divert_root_to_review(conn, task_id):
+                        promoted += 1
+                        continue
                     conn.execute(
                         "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
                         (task_id,),
@@ -3025,6 +3035,69 @@ def recompute_ready(
                 _append_event(conn, task_id, "promoted", None)
                 promoted += 1
     return promoted
+
+
+def _maybe_divert_root_to_review(conn: sqlite3.Connection, task_id: str) -> bool:
+    """If ``task_id`` is a loop-enabled build root with acceptance criteria,
+    transition it ``todo -> review`` (assigned to the orchestrator profile) so a
+    build-verify worker judges the assembled result. Returns True if diverted.
+
+    Fail-soft: any error returns False, leaving classic promotion to proceed.
+    """
+    try:
+        from hermes_cli import kanban_govern
+        if not kanban_govern.orchestrator_loop_enabled():
+            return False
+        # A build root is a task that is the PARENT of at least one child.
+        is_root = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? LIMIT 1", (task_id,)
+        ).fetchone() is not None
+        if not is_root:
+            return False
+        state = kanban_govern.load_build_state(task_id)
+        if not state.get("acceptance"):
+            return False  # no criteria to verify against -> classic promotion
+        # Resolve the orchestrator profile to own the verification.
+        try:
+            from hermes_cli.kanban_decompose import _resolve_orchestrator_profile, _load_config
+            orchestrator = _resolve_orchestrator_profile(_load_config())
+        except Exception:
+            orchestrator = None
+        if orchestrator:
+            conn.execute(
+                "UPDATE tasks SET status = 'review', assignee = ? "
+                "WHERE id = ? AND status = 'todo'",
+                (orchestrator, task_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE tasks SET status = 'review' WHERE id = ? AND status = 'todo'",
+                (task_id,),
+            )
+        kanban_govern.save_build_state(task_id, loop_state="verifying")
+        _append_event(conn, task_id, "build_verify_queued",
+                      {"round": int(state.get("verify_round", 0))})
+        return True
+    except Exception:
+        return False
+
+
+def _is_build_root_in_review(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True if ``task_id`` is a build root (parent of children) with recorded
+    acceptance criteria — i.e. a review task that should load orchestrator-verify
+    rather than the per-PR sdlc-review. Fail-soft: False on any error."""
+    try:
+        from hermes_cli import kanban_govern
+        if not kanban_govern.orchestrator_loop_enabled():
+            return False
+        is_root = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? LIMIT 1", (task_id,)
+        ).fetchone() is not None
+        if not is_root:
+            return False
+        return bool(kanban_govern.load_build_state(task_id).get("acceptance"))
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -3621,6 +3694,178 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+def _parse_verify_verdict(text: str) -> Optional[dict]:
+    """Extract the orchestrator-verify JSON verdict from a worker's result.
+
+    The skill emits one JSON object (on the final line). Be liberal: scan for
+    the last ``{...}`` block that parses and carries a ``verdict`` key. Returns
+    the dict, or None if nothing parseable is found."""
+    if not text:
+        return None
+    import json as _json
+    # Try the whole thing first, then progressively from each '{'.
+    candidates = []
+    s = text.strip()
+    candidates.append(s)
+    # Last line is the documented location.
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    if lines:
+        candidates.append(lines[-1])
+    # Greedy: from the last '{' to the last '}'.
+    lb, rb = s.rfind("{"), s.rfind("}")
+    if lb != -1 and rb != -1 and rb > lb:
+        candidates.append(s[lb:rb + 1])
+    for c in candidates:
+        try:
+            obj = _json.loads(c)
+            if isinstance(obj, dict) and "verdict" in obj:
+                return obj
+        except Exception:
+            continue
+    return None
+
+
+def _verify_fingerprint(verdict: dict) -> str:
+    """A stable hash of what the verifier OBSERVED, for no-progress detection.
+
+    Two consecutive rounds with the same fingerprint mean the corrective work
+    changed nothing the verifier can see — a silent/insistent failure — so the
+    loop should escalate rather than burn its remaining rounds."""
+    import hashlib, json as _json
+    crit = verdict.get("criteria")
+    try:
+        basis = _json.dumps(crit, sort_keys=True, ensure_ascii=False) if crit is not None \
+            else _json.dumps(verdict.get("summary", ""), ensure_ascii=False)
+    except Exception:
+        basis = str(crit)
+    return hashlib.sha256(basis.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _handle_build_verify_completion(
+    conn: sqlite3.Connection, task_id: str, result: Optional[str],
+    summary: Optional[str],
+) -> Optional[bool]:
+    """Orchestrator closed-loop verdict router (E5). Called at the top of
+    ``complete_task``.
+
+    Returns:
+      - ``None``  → not a build-verify completion (or PASS): proceed with the
+                    normal completion path (PASS lets the root flip to done).
+      - ``True``  → FAIL handled here (root reopened with corrections, OR
+                    escalated + parked 'blocked' on exhaustion / no-progress).
+                    The caller returns True WITHOUT marking the root done.
+
+    Fully fail-soft: any error returns None so a hiccup never blocks a normal
+    completion.
+    """
+    try:
+        from hermes_cli import kanban_govern
+        if not kanban_govern.orchestrator_loop_enabled():
+            return None
+        state = kanban_govern.load_build_state(task_id)
+        # Only intercept a root that is actively being verified.
+        if state.get("loop_state") != "verifying" or not state.get("acceptance"):
+            return None
+        is_root = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? LIMIT 1", (task_id,)
+        ).fetchone() is not None
+        if not is_root:
+            return None
+
+        verdict = _parse_verify_verdict(" ".join(filter(None, [result, summary])))
+        if verdict is None:
+            # Verifier produced no parseable verdict — don't silently pass a
+            # build. Park for a human with what we have.
+            _park_build(conn, task_id, kanban_govern,
+                        "verify produced no parseable verdict", state)
+            return True
+
+        if str(verdict.get("verdict", "")).upper() == "PASS":
+            kanban_govern.save_build_state(task_id, loop_state="done",
+                                           last_verdict="PASS",
+                                           last_summary=verdict.get("summary"))
+            with write_txn(conn):
+                _append_event(conn, task_id, "build_verified_pass",
+                              {"round": int(state.get("verify_round", 0)),
+                               "summary": verdict.get("summary")})
+            return None  # let normal completion flip the root to done
+
+        # ---- FAIL ----
+        round_no = int(state.get("verify_round", 0)) + 1
+        fp = _verify_fingerprint(verdict)
+        max_rounds = kanban_govern.max_verify_rounds()
+
+        # No-progress guard (FOURTH ceiling, earliest): identical observation
+        # to last round means the correction changed nothing -> escalate now.
+        if state.get("last_fingerprint") == fp and round_no > 1:
+            _park_build(conn, task_id, kanban_govern,
+                        "no progress between verify rounds (silent failure) — "
+                        + str(verdict.get("summary", "")), state, verdict=verdict)
+            return True
+
+        # Round-cap guard: out of rounds -> escalate + park with diagnosis.
+        if round_no > max_rounds:
+            _park_build(conn, task_id, kanban_govern,
+                        f"verify loop exhausted at round {round_no - 1}/{max_rounds} — "
+                        + str(verdict.get("summary", "")), state, verdict=verdict)
+            return True
+
+        # Still within budget: command the corrections (E4).
+        corrections = verdict.get("corrections") or []
+        corrections = [c for c in corrections if isinstance(c, dict) and c.get("title")]
+        if not corrections:
+            # FAIL but no actionable corrections — can't loop blind, park it.
+            _park_build(conn, task_id, kanban_govern,
+                        "verify FAIL with no corrections supplied", state, verdict=verdict)
+            return True
+
+        kanban_govern.save_build_state(
+            task_id, verify_round=round_no, loop_state="correcting",
+            last_verdict="FAIL", last_fingerprint=fp,
+            last_summary=verdict.get("summary"),
+        )
+        reopen_build_with_children(
+            conn, task_id, corrections,
+            reason=str(verdict.get("summary", "verify FAIL")),
+            round_no=round_no, author="orchestrator",
+        )
+        return True
+    except Exception:
+        return None
+
+
+def _park_build(conn, task_id, kanban_govern, reason: str, state: dict,
+                verdict: Optional[dict] = None) -> None:
+    """Escalate a build to a human: block the root with a full diagnosis and
+    record the loop as parked. The orchestrator guided as far as it safely
+    could; a human now decides (accept / grant more rounds / intervene)."""
+    try:
+        kanban_govern.save_build_state(
+            task_id, loop_state="parked",
+            last_verdict=(verdict or {}).get("verdict", "PARKED"),
+            last_summary=reason,
+            unmet=[c for c in ((verdict or {}).get("criteria") or [])
+                   if isinstance(c, dict) and c.get("met") is False],
+        )
+    except Exception:
+        pass
+    with write_txn(conn):
+        # Sticky human-review block (kanban_block semantics) so recompute_ready
+        # won't auto-recover it — a human must act.
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+            (task_id,),
+        )
+        _append_event(conn, task_id, "build_escalated",
+                      {"reason": reason[:800],
+                       "round": int(state.get("verify_round", 0)),
+                       "recommended_fix": (verdict or {}).get("corrections")})
+        # Emit a block event so _has_sticky_block sees it as human-initiated.
+        _append_event(conn, task_id, "kanban_block",
+                      {"reason": "orchestrator escalation — human review needed"})
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3660,6 +3905,18 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+
+    # ORCHESTRATOR CLOSED-LOOP (E5): if this completion is the orchestrator
+    # finishing a build-verify, route the verdict. PASS -> fall through to
+    # normal completion (root -> done). FAIL -> reopen with corrective tasks
+    # OR escalate+park; in that case return True here WITHOUT marking done.
+    # Fail-soft + flag-gated: returns None (proceed normally) unless this is a
+    # verifying build root. Placed before created_cards so a verify completion
+    # (which creates corrective cards via reopen, not via created_cards) isn't
+    # blocked by the phantom-card gate.
+    _loop = _handle_build_verify_completion(conn, task_id, result, summary)
+    if _loop is True:
+        return True
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -4664,6 +4921,109 @@ def decompose_triage_task(
     # for manual-review-first workflows.
     if auto_promote:
         recompute_ready(conn)
+    return child_ids
+
+
+def reopen_build_with_children(
+    conn: sqlite3.Connection,
+    root_id: str,
+    children: list[dict],
+    *,
+    reason: str,
+    round_no: int,
+    author: Optional[str] = None,
+) -> Optional[list[str]]:
+    """Re-open a build root with a fresh batch of CORRECTIVE child tasks.
+
+    This is the orchestrator closed-loop's FAIL path: after the verify worker
+    judges the assembled build does not meet acceptance, it returns directive
+    corrections. This creates those corrective tasks under the existing root,
+    re-links the root to wait on them, and transitions the root back to
+    ``todo`` so it re-enters the build→verify cycle.
+
+    Mirrors ``decompose_triage_task``'s child-insert + root-relink, but the
+    root is in ``running``/``review`` (the verify worker holds it), not
+    ``triage``. Each child body carries the orchestrator's directive so the
+    builder gets specific guidance, not a re-statement of the goal.
+
+    Returns the new child ids, or None if the root is missing / has no
+    children to create.
+    """
+    if not children:
+        return None
+    # Validate shape (titles required; corrective tasks are flat — no inter-
+    # sibling parents, they all just need to finish before the root re-verifies).
+    for idx, child in enumerate(children):
+        if not isinstance(child, dict):
+            raise ValueError(f"correction[{idx}] is not a dict")
+        if not isinstance(child.get("title"), str) or not child["title"].strip():
+            raise ValueError(f"correction[{idx}].title is required")
+    now = int(time.time())
+    child_ids: list[str] = []
+    with write_txn(conn):
+        root_row = conn.execute(
+            "SELECT id, status, tenant, workspace_kind, workspace_path, assignee "
+            "FROM tasks WHERE id = ?",
+            (root_id,),
+        ).fetchone()
+        if root_row is None:
+            return None
+        tenant = root_row["tenant"]
+        root_ws_kind = root_row["workspace_kind"] or "scratch"
+        root_ws_path = root_row["workspace_path"]
+        for child in children:
+            new_id = _new_task_id()
+            title = child["title"].strip()
+            body = child.get("body")
+            assignee = _canonical_assignee(child.get("assignee"))
+            child_ws_kind = child.get("workspace_kind") or root_ws_kind
+            if child.get("workspace_path"):
+                child_ws_path = child.get("workspace_path")
+            elif child_ws_kind == root_ws_kind:
+                child_ws_path = root_ws_path
+            else:
+                child_ws_path = None
+            conn.execute(
+                "INSERT INTO tasks "
+                "(id, title, body, assignee, status, workspace_kind, "
+                " workspace_path, tenant, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                (
+                    new_id, title,
+                    body if isinstance(body, str) else None,
+                    assignee, child_ws_kind, child_ws_path, tenant, now,
+                    (author or "orchestrator"),
+                ),
+            )
+            _append_event(
+                conn, new_id, "created",
+                {"by": author or "orchestrator",
+                 "corrective_for": root_id, "verify_round": round_no},
+            )
+            child_ids.append(new_id)
+        # Root waits on every corrective child (root is child of each).
+        for cid in child_ids:
+            conn.execute(
+                "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
+                "VALUES (?, ?)",
+                (cid, root_id),
+            )
+        # Re-open the root: review/running -> todo. Clear any claim so the
+        # next recompute_ready re-promotes it to 'review' once the corrective
+        # children finish. Keep the orchestrator as assignee.
+        conn.execute(
+            "UPDATE tasks SET status = 'todo', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
+            "WHERE id = ?",
+            (root_id,),
+        )
+        _append_event(
+            conn, root_id, "build_reopened",
+            {"round": round_no, "reason": reason[:500],
+             "corrective_child_ids": child_ids},
+        )
+    # Promote parent-free corrective children so the dispatcher picks them up.
+    recompute_ready(conn)
     return child_ids
 
 
@@ -6481,12 +6841,24 @@ def dispatch_once(
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load sdlc-review skill for review agents.  The
+        # Force-load the review skill for review agents.  The
         # _default_spawn function already auto-loads kanban-worker, and
         # appends task.skills via --skills.  Setting task.skills here
         # means the review agent gets both kanban-worker (lifecycle)
-        # and sdlc-review (review logic: AC verification, merge, etc.).
+        # and the review logic.
+        #
+        # ORCHESTRATOR CLOSED-LOOP: if this review task is a BUILD ROOT
+        # (it is the parent of children) AND has recorded acceptance
+        # criteria, it reached 'review' via the orchestrator-loop divert
+        # in recompute_ready — load orchestrator-verify (judge the
+        # assembled build vs acceptance, command corrections) instead of
+        # the per-PR sdlc-review. Fail-soft to sdlc-review on any error.
         claimed.skills = ["sdlc-review"]
+        try:
+            if _is_build_root_in_review(conn, claimed.id):
+                claimed.skills = ["orchestrator-verify"]
+        except Exception:
+            pass
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
