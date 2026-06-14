@@ -241,6 +241,16 @@ def _governance_block(name: str) -> Dict[str, Any]:
     return gov if isinstance(gov, dict) else {}
 
 
+def _profile_model(name: str) -> Optional[str]:
+    """The configured model.default for a profile (the agent's LLM)."""
+    cp = _profile_config_path(name)
+    if cp is None:
+        return None
+    cfg = _load_yaml_file(cp)
+    d = (cfg.get("model") or {}).get("default")
+    return d if isinstance(d, str) and d else None
+
+
 def _hybrid_enabled(name: str) -> bool:
     """Whether the Ezra-JS Hybrid is ON for a profile.
 
@@ -424,6 +434,7 @@ def build_status(board: Optional[str] = None) -> Dict[str, Any]:
             "protected_paths": gov.get("protected_paths", []) or [],
             "secret_scan": gov.get("secret_scan", True) is not False,
             "hybrid": _hybrid_enabled(name),
+            "model": _profile_model(name),
             "governed": bool(gov),
         })
 
@@ -499,6 +510,42 @@ def _set_level(level: str, profiles: List[str]) -> Dict[str, Any]:
         if new is not None and _save_text(cp, new):
             changed.append(name)
     return {"ok": bool(changed), "changed": changed, "level": level}
+
+
+# 9Router model-id SHAPE compatibility (see memory 9router-model-shapes):
+#   cc/  -> Anthropic-native  (engine-OK)
+#   ag/  -> Anthropic-shape   (engine-OK, incl. cross-family GPT/Gemini)
+#   cx/  -> OpenAI-shape      (BREAKS the Hermes anthropic adapter on tool calls)
+# A model whose id is cx/* must be REJECTED at the write layer — not just warned
+# in the UI — so a worker can never be silently pointed at a build-breaking id.
+def _model_shape_ok(model_id: str) -> bool:
+    mid = (model_id or "").strip().lower()
+    return not mid.startswith("cx/")
+
+
+def _set_model(model_id: str, profiles: List[str]) -> Dict[str, Any]:
+    """Write ``model.default`` for each profile (surgical). Rejects cx/ ids."""
+    model_id = (model_id or "").strip()
+    if not model_id:
+        return {"ok": False, "error": "empty model id"}
+    if not _model_shape_ok(model_id):
+        return {
+            "ok": False,
+            "error": (
+                f"refusing model {model_id!r}: cx/ ids are OpenAI-shape and break "
+                f"the Hermes anthropic adapter on tool calls. Use a cc/ or ag/ id."
+            ),
+        }
+    changed = []
+    for name in profiles:
+        cp = _profile_config_path(name)
+        if cp is None:
+            continue
+        text = cp.read_text(encoding="utf-8")
+        new = _set_path(text, ["model", "default"], model_id)
+        if new is not None and _save_text(cp, new):
+            changed.append(name)
+    return {"ok": bool(changed), "changed": changed, "model": model_id}
 
 
 def _set_secret_scan(on: bool, profiles: List[str]) -> Dict[str, Any]:
@@ -693,6 +740,62 @@ def _set_budget_default(key: str, value: Optional[int]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Model catalog (shape-safe — only engine-compatible cc/ + ag/ ids)
+# ---------------------------------------------------------------------------
+
+def _router_base_url() -> Optional[str]:
+    """The model base_url a factory profile points at (the 9Router endpoint)."""
+    try:
+        # Read any factory profile's model.base_url (they all share 9Router).
+        for name in _factory_profiles():
+            cp = _profile_config_path(name)
+            if cp is None:
+                continue
+            cfg = _load_yaml_file(cp)
+            bu = (cfg.get("model") or {}).get("base_url")
+            if isinstance(bu, str) and bu:
+                return bu.rstrip("/")
+    except Exception:
+        pass
+    return None
+
+
+def list_safe_models() -> Dict[str, Any]:
+    """Fetch the model list from 9Router /v1/models and return only the
+    engine-compatible cc/ + ag/ ids. Fail-soft: on any error, returns the
+    distinct models currently configured across the factory profiles so the UI
+    always has *something* selectable."""
+    base = _router_base_url()
+    safe: List[str] = []
+    source = "router"
+    if base:
+        try:
+            import json as _json
+            import urllib.request
+            req = urllib.request.Request(base + "/models", headers={"x-api-key": "9router-local"})
+            with urllib.request.urlopen(req, timeout=5) as r:  # nosec - localhost
+                data = _json.loads(r.read().decode("utf-8"))
+            ids = [m.get("id") for m in data.get("data", []) if isinstance(m, dict)]
+            safe = sorted({i for i in ids if isinstance(i, str) and (i.startswith("cc/") or i.startswith("ag/"))})
+        except Exception:
+            safe = []
+    if not safe:
+        # Fallback: the models currently in use across the profiles.
+        source = "configured"
+        cur = set()
+        for name in _factory_profiles():
+            cp = _profile_config_path(name)
+            if cp is None:
+                continue
+            cfg = _load_yaml_file(cp)
+            d = (cfg.get("model") or {}).get("default")
+            if isinstance(d, str) and d:
+                cur.add(d)
+        safe = sorted(cur)
+    return {"models": safe, "source": source, "base_url": base}
+
+
+# ---------------------------------------------------------------------------
 # Settings change-log (reversible history)
 # ---------------------------------------------------------------------------
 
@@ -805,6 +908,8 @@ def cmd_govern(args: argparse.Namespace) -> int:
             results.append(_edit_protected(None, args.remove_protected, profiles))
         if getattr(args, "hybrid", None) is not None:
             results.append(_set_hybrid(args.hybrid == "on", profiles))
+        if getattr(args, "model", None):
+            results.append(_set_model(args.model, profiles))
         for key in ("orchestrator_profile", "default_assignee"):
             val = getattr(args, key, None)
             if val is not None:
@@ -824,7 +929,7 @@ def cmd_govern(args: argparse.Namespace) -> int:
         for r in results:
             if not r.get("ok"):
                 continue
-            for k in ("level", "secret_scan", "hybrid", "added", "removed", "key", "value"):
+            for k in ("level", "secret_scan", "hybrid", "model", "added", "removed", "key", "value"):
                 if k in r and r[k] is not None:
                     _log_change("set", scope, k, None, r[k])
                     break
@@ -843,6 +948,10 @@ def cmd_govern(args: argparse.Namespace) -> int:
 
     if sub == "changelog":
         print(json.dumps({"change_log": _recent_changes(200)}, indent=2, ensure_ascii=False))
+        return 0
+
+    if sub == "models":
+        print(json.dumps(list_safe_models(), indent=2, ensure_ascii=False))
         return 0
 
     print(f"govern: unknown subcommand {sub!r}", file=sys.stderr)
@@ -880,6 +989,7 @@ def register(subparsers) -> None:
     pset.add_argument("--add-protected", dest="add_protected", metavar="GLOB", help="Add a protected-path glob")
     pset.add_argument("--remove-protected", dest="remove_protected", metavar="GLOB", help="Remove a protected-path glob")
     pset.add_argument("--hybrid", choices=["on", "off"], help="Ezra-JS Hybrid (per --for-profile)")
+    pset.add_argument("--model", help="Set the agent's model (model.default). cc/ or ag/ ids only; cx/ is rejected (breaks the adapter).")
     pset.add_argument("--for-profile", dest="for_profile", help="Restrict the change to one profile (default: all factory profiles). NOT --profile (that's hermes's global active-profile switch).")
     pset.add_argument("--orchestrator-profile", dest="orchestrator_profile", help="Set kanban.orchestrator_profile (root config)")
     pset.add_argument("--default-assignee", dest="default_assignee", help="Set kanban.default_assignee (root config)")
@@ -891,3 +1001,4 @@ def register(subparsers) -> None:
     pks.add_argument("state", choices=["on", "off"], help="on = halt the factory, off = resume")
 
     gsub.add_parser("changelog", help="Show the reversible settings change-log (JSON)")
+    gsub.add_parser("models", help="List engine-compatible (cc/ + ag/) models from 9Router for the model picker")
