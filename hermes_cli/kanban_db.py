@@ -3037,6 +3037,31 @@ def recompute_ready(
     return promoted
 
 
+def _is_build_root(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True if ``task_id`` is a decomposed build ROOT.
+
+    Link convention (see :func:`decompose_triage_task`): an edge
+    ``task_links(parent_id, child_id)`` means *parent is a prerequisite the
+    child waits on*. The decomposer links the root as a child of every leaf —
+    "the root is only ever a child here, never a parent of children" — so the
+    root is the dependency-graph SINK: it WAITS ON at least one task (appears
+    as ``child_id``) and is itself nobody's prerequisite (never a ``parent_id``).
+
+    Detecting a root by ``parent_id = ?`` (the old check) is therefore wrong —
+    a real decomposed root never appears as a ``parent_id`` at all, so the loop
+    never fired. We test the sink shape instead.
+    """
+    waits_on_children = conn.execute(
+        "SELECT 1 FROM task_links WHERE child_id = ? LIMIT 1", (task_id,)
+    ).fetchone() is not None
+    if not waits_on_children:
+        return False
+    is_prerequisite = conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? LIMIT 1", (task_id,)
+    ).fetchone() is not None
+    return not is_prerequisite
+
+
 def _maybe_divert_root_to_review(conn: sqlite3.Connection, task_id: str) -> bool:
     """If ``task_id`` is a loop-enabled build root with acceptance criteria,
     transition it ``todo -> review`` (assigned to the orchestrator profile) so a
@@ -3048,11 +3073,7 @@ def _maybe_divert_root_to_review(conn: sqlite3.Connection, task_id: str) -> bool
         from hermes_cli import kanban_govern
         if not kanban_govern.orchestrator_loop_enabled():
             return False
-        # A build root is a task that is the PARENT of at least one child.
-        is_root = conn.execute(
-            "SELECT 1 FROM task_links WHERE parent_id = ? LIMIT 1", (task_id,)
-        ).fetchone() is not None
-        if not is_root:
+        if not _is_build_root(conn, task_id):
             return False
         state = kanban_govern.load_build_state(task_id)
         if not state.get("acceptance"):
@@ -3083,17 +3104,15 @@ def _maybe_divert_root_to_review(conn: sqlite3.Connection, task_id: str) -> bool
 
 
 def _is_build_root_in_review(conn: sqlite3.Connection, task_id: str) -> bool:
-    """True if ``task_id`` is a build root (parent of children) with recorded
-    acceptance criteria — i.e. a review task that should load orchestrator-verify
-    rather than the per-PR sdlc-review. Fail-soft: False on any error."""
+    """True if ``task_id`` is a build root (dependency-graph sink — see
+    :func:`_is_build_root`) with recorded acceptance criteria — i.e. a review
+    task that should load orchestrator-verify rather than the per-PR
+    sdlc-review. Fail-soft: False on any error."""
     try:
         from hermes_cli import kanban_govern
         if not kanban_govern.orchestrator_loop_enabled():
             return False
-        is_root = conn.execute(
-            "SELECT 1 FROM task_links WHERE parent_id = ? LIMIT 1", (task_id,)
-        ).fetchone() is not None
-        if not is_root:
+        if not _is_build_root(conn, task_id):
             return False
         return bool(kanban_govern.load_build_state(task_id).get("acceptance"))
     except Exception:
@@ -3766,10 +3785,7 @@ def _handle_build_verify_completion(
         # Only intercept a root that is actively being verified.
         if state.get("loop_state") != "verifying" or not state.get("acceptance"):
             return None
-        is_root = conn.execute(
-            "SELECT 1 FROM task_links WHERE parent_id = ? LIMIT 1", (task_id,)
-        ).fetchone() is not None
-        if not is_root:
+        if not _is_build_root(conn, task_id):
             return None
 
         verdict = _parse_verify_verdict(" ".join(filter(None, [result, summary])))
@@ -3876,11 +3892,14 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running|ready -> done`` and record ``result``.
+    """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
-    a claim/start/complete sequence.
+    a claim/start/complete sequence. ``review`` is accepted so the
+    orchestrator closed-loop can flip a verified-PASS build root (which the
+    loop parks in ``review`` for the verify worker) to ``done`` — without it,
+    every passing build would strand in ``review``.
 
     ``summary`` and ``metadata`` are stored on the closing run (if any)
     and surfaced to downstream children via :func:`build_worker_context`.
@@ -3957,7 +3976,7 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'review')
                 """,
                 (result, now, task_id),
             )
@@ -3972,7 +3991,7 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'review')
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
