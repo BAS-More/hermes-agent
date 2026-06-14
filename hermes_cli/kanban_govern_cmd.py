@@ -62,7 +62,7 @@ def _profile_home(name: str) -> Optional[Path]:
     except Exception:
         # Fall back to the conventional layout under HERMES_HOME root.
         try:
-            from hermes_cli.kanban_db import get_hermes_home
+            from hermes_cli.config import get_hermes_home
             root = Path(get_hermes_home())
             # If we're already in a profile home, go up to the root.
             if root.name == name and root.parent.name == "profiles":
@@ -352,7 +352,7 @@ def _recent_builds(limit: int = 25) -> List[Dict[str, Any]]:
     """
     candidates = [os.environ.get("HERMES_FACTORY_BUILDS")]
     try:
-        from hermes_cli.kanban_db import get_hermes_home
+        from hermes_cli.config import get_hermes_home
         hh = Path(get_hermes_home())
         # If we're inside a profile home, climb to the engine root.
         if hh.parent.name == "profiles":
@@ -447,16 +447,37 @@ def build_status(board: Optional[str] = None) -> Dict[str, Any]:
             "recent_governance_blocks": _recent_audit(),
             "recent_budget_events": _recent_budget_events(board),
             "recent_builds": _recent_builds(),
+            "change_log": _recent_changes(),
         },
     }
 
 
 def _budget_status(board: Optional[str]) -> Dict[str, Any]:
-    """Budget breaker config + kill-switch. Ceilings are per-build (set at
-    create time), so we surface the kill-switch + the breaker dimensions."""
+    """Budget breaker config + kill-switch + the factory default ceilings that
+    new cards inherit (kanban.budget.default_*; 0/unset = unlimited)."""
+    default_iter = None
+    default_wall = None
+    retry_cap = None
+    try:
+        from hermes_cli.config import load_config
+        bud = (load_config().get("kanban") or {}).get("budget") or {}
+        di = bud.get("default_max_iterations")
+        dw = bud.get("default_wallclock_seconds")
+        default_iter = int(di) if di not in (None, 0, "0") else None
+        default_wall = int(dw) if dw not in (None, 0, "0") else None
+    except Exception:
+        pass
+    try:
+        from hermes_cli import kanban_govern
+        retry_cap = kanban_govern.RETRY_CAP
+    except Exception:
+        pass
     return {
         "kill_switch": _killswitch_status(board),
         "dimensions": ["wallclock", "iterations", "killswitch", "usd (reserved)", "tokens (reserved)"],
+        "default_max_iterations": default_iter,
+        "default_wallclock_seconds": default_wall,
+        "per_block_retry_cap": retry_cap,
     }
 
 
@@ -622,21 +643,25 @@ def _set_hybrid(on: bool, profiles: List[str]) -> Dict[str, Any]:
     return {"ok": bool(changed), "changed": changed, "hybrid": on}
 
 
-def _set_orchestration(key: str, value: Any) -> Dict[str, Any]:
-    """Write a kanban orchestration knob to the ROOT config.yaml."""
+def _root_config_path() -> Optional[Path]:
+    """The ROOT config.yaml path (climbs out of a profile home if needed)."""
     try:
-        from hermes_cli.kanban_db import get_hermes_home
-        # Root config: HERMES_HOME may currently point at a profile; the
-        # orchestration block lives in the active (root) config the gateway
-        # reads. We resolve the config path the same way load_config does.
-        from hermes_cli import config as config_mod
+        from hermes_cli.config import get_hermes_home
         root = Path(get_hermes_home())
-        # If we're inside a profile home, climb to the root.
         if root.parent.name == "profiles":
             root = root.parent.parent
         cp = root / "config.yaml"
-        if not cp.exists():
-            return {"ok": False, "error": f"config not found at {cp}"}
+        return cp if cp.exists() else None
+    except Exception:
+        return None
+
+
+def _set_orchestration(key: str, value: Any) -> Dict[str, Any]:
+    """Write a kanban orchestration knob to the ROOT config.yaml."""
+    cp = _root_config_path()
+    if cp is None:
+        return {"ok": False, "error": "root config.yaml not found"}
+    try:
         text = cp.read_text(encoding="utf-8")
         yv = value if isinstance(value, str) else ("true" if value else "false")
         new = _set_path(text, ["kanban", key], yv)
@@ -644,6 +669,83 @@ def _set_orchestration(key: str, value: Any) -> Dict[str, Any]:
         return {"ok": ok, "key": key, "value": value, "path": str(cp)}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+
+
+def _set_budget_default(key: str, value: Optional[int]) -> Dict[str, Any]:
+    """Write a default budget ceiling to ROOT config kanban.budget.<key>.
+
+    ``key`` is 'default_max_iterations' or 'default_wallclock_seconds'. A None
+    value clears it (unlimited) by writing an explicit empty — but since the
+    surgical writer doesn't delete keys, we write 0 to mean 'unlimited' and the
+    consumer treats <=0 as unset.
+    """
+    cp = _root_config_path()
+    if cp is None:
+        return {"ok": False, "error": "root config.yaml not found"}
+    try:
+        text = cp.read_text(encoding="utf-8")
+        yv = str(int(value)) if value is not None else "0"
+        new = _set_path(text, ["kanban", "budget", key], yv)
+        ok = new is not None and _save_text(cp, new)
+        return {"ok": ok, "key": f"budget.{key}", "value": value, "path": str(cp)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Settings change-log (reversible history)
+# ---------------------------------------------------------------------------
+
+def _changelog_path() -> Optional[Path]:
+    try:
+        from hermes_cli.config import get_hermes_home
+        root = Path(get_hermes_home())
+        if root.parent.name == "profiles":
+            root = root.parent.parent
+        return root / "factory-governance-changelog.jsonl"
+    except Exception:
+        return None
+
+
+def _log_change(action: str, target: str, key: str, old: Any, new: Any) -> None:
+    """Append a reversible change record. Best-effort, never raises."""
+    p = _changelog_path()
+    if p is None:
+        return
+    try:
+        import time as _t
+        rec = {
+            "id": f"chg_{int(_t.time()*1000)}",
+            "ts": _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),
+            "action": action, "target": target, "key": key,
+            "old": old, "new": new,
+        }
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _recent_changes(limit: int = 50) -> List[Dict[str, Any]]:
+    p = _changelog_path()
+    if p is None or not p.exists():
+        return []
+    try:
+        out: List[Dict[str, Any]] = []
+        for ln in reversed(p.read_text(encoding="utf-8").splitlines()):
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                out.append(json.loads(ln))
+            except Exception:
+                continue
+            if len(out) >= limit:
+                break
+        return out
+    except Exception:
+        return []
 
 
 def _killswitch(on: bool, board: Optional[str]) -> Dict[str, Any]:
@@ -709,9 +811,23 @@ def cmd_govern(args: argparse.Namespace) -> int:
                 results.append(_set_orchestration(key, val))
         if getattr(args, "auto_decompose", None) is not None:
             results.append(_set_orchestration("auto_decompose", args.auto_decompose == "on"))
+        if getattr(args, "default_max_iterations", None) is not None:
+            results.append(_set_budget_default("default_max_iterations", args.default_max_iterations))
+        if getattr(args, "default_wallclock", None) is not None:
+            results.append(_set_budget_default("default_wallclock_seconds", args.default_wallclock))
         if not results:
             print("govern set: nothing to change (pass --level / --secret-scan / --add-protected / ...)", file=sys.stderr)
             return 2
+        # Log each successful change to the reversible change-log. Each setter
+        # result carries a recognizable key/value pair; pick the first present.
+        scope = getattr(args, "for_profile", None) or "all"
+        for r in results:
+            if not r.get("ok"):
+                continue
+            for k in ("level", "secret_scan", "hybrid", "added", "removed", "key", "value"):
+                if k in r and r[k] is not None:
+                    _log_change("set", scope, k, None, r[k])
+                    break
         out = {"ok": all(r.get("ok") for r in results), "results": results}
         print(json.dumps(out, indent=2, ensure_ascii=False))
         return 0 if out["ok"] else 1
@@ -719,8 +835,15 @@ def cmd_govern(args: argparse.Namespace) -> int:
     if sub == "killswitch":
         on = getattr(args, "state", None) == "on"
         out = _killswitch(on, board)
+        # Kill-switch is logged too (it's a high-impact change).
+        if out.get("ok"):
+            _log_change("killswitch", "all", "kill_switch", None, on)
         print(json.dumps(out, indent=2, ensure_ascii=False))
         return 0 if out.get("ok") else 1
+
+    if sub == "changelog":
+        print(json.dumps({"change_log": _recent_changes(200)}, indent=2, ensure_ascii=False))
+        return 0
 
     print(f"govern: unknown subcommand {sub!r}", file=sys.stderr)
     return 2
@@ -761,6 +884,10 @@ def register(subparsers) -> None:
     pset.add_argument("--orchestrator-profile", dest="orchestrator_profile", help="Set kanban.orchestrator_profile (root config)")
     pset.add_argument("--default-assignee", dest="default_assignee", help="Set kanban.default_assignee (root config)")
     pset.add_argument("--auto-decompose", dest="auto_decompose", choices=["on", "off"], help="Toggle auto-decompose")
+    pset.add_argument("--default-max-iterations", dest="default_max_iterations", type=int, help="Default build iteration ceiling for new cards (0=unlimited)")
+    pset.add_argument("--default-wallclock", dest="default_wallclock", type=int, help="Default build wall-clock ceiling (seconds) for new cards (0=unlimited)")
 
     pks = gsub.add_parser("killswitch", help="Touch/remove the STOP sentinel (halt/resume all spawns)")
     pks.add_argument("state", choices=["on", "off"], help="on = halt the factory, off = resume")
+
+    gsub.add_parser("changelog", help="Show the reversible settings change-log (JSON)")

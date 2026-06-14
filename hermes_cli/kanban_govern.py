@@ -78,6 +78,20 @@ DEFAULT_LEVEL = LEVEL_WARN
 # Severities a finding can carry, for the gate/strict decision.
 _SEV_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
+# Codes that are TRUE EMERGENCIES — these may hard-block a worker even under the
+# "emergency-only" autonomy posture. Everything else (GOV-PROTECTED, etc.) caps
+# at `warn` so an autonomous build is never deadlocked by a policy nitpick; the
+# worker self-corrects + retries instead. (The manual kill-switch is a separate
+# hard-halt via the budget breaker path, not a finding.)
+EMERGENCY_CODES = {"SEC-SECRETS"}
+
+# Autonomy posture: when emergency_only is True (the DEFAULT — Avi's "governance
+# guides, doesn't stop the factory" principle), non-emergency findings can never
+# resolve to `block`; they warn + log + let the build continue. Set
+# `kanban.governance.emergency_only: false` (or per-build .ezra governance.yaml)
+# to restore classic gate/strict hard-blocking on any high/critical finding.
+DEFAULT_EMERGENCY_ONLY = True
+
 # The on-disk governance directory, EZRA-compatible. Lives in the build root's
 # workspace so every worker on the build (each in its own worktree off the
 # same root workspace, or the shared dir) resolves the same governance.
@@ -521,6 +535,23 @@ def resolve_level(workspace: Path) -> str:
     return lvl if lvl in _VALID_LEVELS else DEFAULT_LEVEL
 
 
+def resolve_emergency_only(workspace: Optional[Path]) -> bool:
+    """Whether only EMERGENCY_CODES may hard-block (the autonomy posture).
+
+    Reads ``emergency_only`` from the build's governance (per-build .ezra wins
+    over the kanban.governance config default); falls back to
+    ``DEFAULT_EMERGENCY_ONLY``. Any value that isn't an explicit false leaves the
+    safe autonomy default in place.
+    """
+    try:
+        gov = load_governance(workspace) if workspace is not None else _config_governance()
+        if "emergency_only" in (gov or {}):
+            return bool(gov.get("emergency_only"))
+    except Exception:
+        pass
+    return DEFAULT_EMERGENCY_ONLY
+
+
 def resolve_protected_paths(workspace: Path) -> List[str]:
     """Glob patterns the build marks protected (writes need an ACTIVE ADR)."""
     gov = load_governance(workspace)
@@ -657,7 +688,29 @@ def check_tool_call(
         # so at the WARN default they surface to the worker; a build that wants
         # them to hard-block sets oversight.level=gate (config default does).
         level = resolve_level(workspace) if workspace is not None else DEFAULT_LEVEL
-        result = _apply_level(base, level, findings, root_id)
+        emergency_only = resolve_emergency_only(workspace)
+        result = _apply_level(base, level, findings, root_id, emergency_only=emergency_only)
+        # Per-block retry cap: if this task keeps hitting the SAME blocking code,
+        # append a "stop looping, change approach / escalate" nudge so the worker
+        # breaks out of a futile self-correct loop. The block STILL HOLDS (we
+        # never auto-allow — a blocked secret stays blocked); the budget breaker
+        # is the hard backstop. Only meaningful on a real block decision.
+        if result.get("decision") == "block":
+            for f in findings:
+                code = f.get("code")
+                if not code:
+                    continue
+                prior = _recent_block_count(task_id, code)
+                if prior >= RETRY_CAP:
+                    result["message"] = (
+                        (result.get("message") or "")
+                        + f"  [retry-cap: this task has hit {code} {prior}×; "
+                        f"STOP retrying the same approach — record the required "
+                        f"decision, remove the offending content, or escalate. "
+                        f"The build's budget breaker will halt a runaway loop.]"
+                    )
+                    result["retry_capped"] = True
+                    break
         # Self-audit: record any non-allow decision (best-effort, never raises).
         audit_event(
             task_id=task_id,
@@ -678,6 +731,8 @@ def _apply_level(
     level: str,
     findings: List[Dict[str, Any]],
     root_id: str,
+    *,
+    emergency_only: bool = DEFAULT_EMERGENCY_ONLY,
 ) -> Dict[str, Any]:
     base["level"] = level
     base["findings"] = findings
@@ -689,23 +744,38 @@ def _apply_level(
     worst = max(_SEV_ORDER.get(f.get("severity", "low"), 0) for f in findings)
     msg = "; ".join(f["message"] for f in findings)
 
+    # Autonomy posture: under emergency_only, a high/critical finding may hard-
+    # block ONLY if at least one finding is an EMERGENCY code (SEC-SECRETS).
+    # Otherwise the build keeps running (warn + log) and the worker self-corrects
+    # — governance guides, it doesn't deadlock an autonomous build.
+    has_emergency = any(
+        f.get("code") in EMERGENCY_CODES for f in findings
+    )
+    block_allowed = (not emergency_only) or has_emergency
+
+    def _block():
+        base["decision"] = "block"
+        base["message"] = f"⛔ governance blocked ({level}): {msg}"
+
+    def _warn():
+        base["decision"] = "warn"
+        base["message"] = f"⚠️ governance ({level}): {msg}"
+
     if level == LEVEL_MONITOR:
         base["decision"] = "allow"
         base["message"] = None
     elif level == LEVEL_WARN:
-        base["decision"] = "warn"
-        base["message"] = f"⚠️ governance ({level}): {msg}"
+        _warn()
     elif level == LEVEL_GATE:
-        # Block high/critical, warn on the rest.
-        if worst >= _SEV_ORDER["high"]:
-            base["decision"] = "block"
-            base["message"] = f"⛔ governance blocked ({level}): {msg}"
+        if worst >= _SEV_ORDER["high"] and block_allowed:
+            _block()
         else:
-            base["decision"] = "warn"
-            base["message"] = f"⚠️ governance ({level}): {msg}"
+            _warn()
     elif level == LEVEL_STRICT:
-        base["decision"] = "block"
-        base["message"] = f"⛔ governance blocked ({level}): {msg}"
+        if block_allowed:
+            _block()
+        else:
+            _warn()
     return base
 
 
@@ -893,3 +963,42 @@ def audit_event(
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+# Per-block self-correct retry cap: how many times the SAME (task, finding-code)
+# may block before the gate appends a "stop looping — change approach" nudge to
+# the block message. The block still HOLDS (we never auto-allow a blocked secret
+# — that would be a security hole); the cap just breaks the worker out of a
+# futile retry loop by telling it to change strategy or escalate. The build-level
+# budget breaker remains the hard backstop that actually halts a runaway build.
+RETRY_CAP = 5
+
+
+def _recent_block_count(task_id: str, code: str, window: int = 50) -> int:
+    """How many recent blocks of ``code`` this ``task_id`` already has, from the
+    audit log. Best-effort (0 on any error)."""
+    if not task_id or not code:
+        return 0
+    p = _audit_path()
+    if p is None or not Path(p).exists():
+        return 0
+    try:
+        lines = Path(p).read_text(encoding="utf-8").splitlines()
+        n = 0
+        for ln in reversed(lines[-window * 4:]):  # scan a bounded tail
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                rec = json.loads(ln)
+            except Exception:
+                continue
+            if rec.get("task_id") != task_id or rec.get("decision") != "block":
+                continue
+            if any((f or {}).get("code") == code for f in rec.get("findings", [])):
+                n += 1
+            if n >= window:
+                break
+        return n
+    except Exception:
+        return 0

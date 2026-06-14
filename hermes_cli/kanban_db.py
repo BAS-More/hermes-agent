@@ -2138,6 +2138,24 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+
+    # Default budget ceilings: when a build ROOT (no parents) is created without
+    # an explicit ceiling, inherit the factory default from
+    # ``kanban.budget.default_max_iterations`` / ``default_wallclock_seconds``.
+    # This is the seatbelt that bounds the autonomous self-correct retry loop so
+    # it can't run away (see kanban_govern + the budget breaker). Children
+    # inherit the root's ceilings via the breaker's subtree resolution, so we
+    # only seed the root. Best-effort: any error leaves the ceilings unset.
+    if not parents:
+        try:
+            from hermes_cli.config import load_config
+            _bud = (load_config().get("kanban") or {}).get("budget") or {}
+            if max_build_iterations is None and _bud.get("default_max_iterations") is not None:
+                max_build_iterations = int(_bud["default_max_iterations"])
+            if wallclock_ceiling_seconds is None and _bud.get("default_wallclock_seconds") is not None:
+                wallclock_ceiling_seconds = int(_bud["default_wallclock_seconds"])
+        except Exception:
+            pass
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
