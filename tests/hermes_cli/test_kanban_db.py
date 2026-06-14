@@ -4372,3 +4372,137 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator closed-loop (regression for the link-direction + review-status
+# bugs found by the 2026-06-15 live proof)
+# ---------------------------------------------------------------------------
+
+def _enable_loop(monkeypatch, max_rounds=3):
+    """Turn the orchestrator loop on without a real config, and pin the
+    orchestrator profile resolution to a deterministic value."""
+    from hermes_cli import kanban_govern
+    monkeypatch.setattr(kanban_govern, "orchestrator_loop_enabled", lambda: True)
+    monkeypatch.setattr(kanban_govern, "max_verify_rounds", lambda: max_rounds)
+    # Resolve the orchestrator profile deterministically (no profile dir in tests).
+    from hermes_cli import kanban_decompose
+    monkeypatch.setattr(kanban_decompose, "_resolve_orchestrator_profile",
+                        lambda cfg: "architect")
+    monkeypatch.setattr(kanban_decompose, "_load_config", lambda: {})
+
+
+def test_is_build_root_matches_real_decompose_link_direction(kanban_home, monkeypatch):
+    """The decomposer links the ROOT as the dependency-graph SINK (root is the
+    child of every leaf — "only ever a child, never a parent"). _is_build_root
+    must detect that shape, NOT ``parent_id = root`` (the original bug, which
+    was structurally always False for a real decomposed build)."""
+    _enable_loop(monkeypatch)
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="build root", triage=True)
+        kb.decompose_triage_task(
+            conn, root, root_assignee="architect",
+            children=[
+                {"title": "child A", "assignee": "test-writer"},
+                {"title": "child B", "assignee": "backend-engineer", "parents": [0]},
+            ],
+        )
+        # Root is the sink: it is a child of every leaf, never a parent.
+        assert kb._is_build_root(conn, root) is True
+        # Workers are NOT roots.
+        worker_ids = [r["child_id"] for r in conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id IS NOT NULL"
+        ).fetchall() if r["child_id"] != root]
+        for wid in set(worker_ids):
+            assert kb._is_build_root(conn, wid) is False
+
+
+def test_orchestrator_loop_fail_then_pass_to_done(kanban_home, monkeypatch):
+    """Full closed loop on the real engine path: decompose -> children done ->
+    root diverts todo->review -> FAIL verdict reopens with a corrective child
+    -> correction done -> re-divert to review -> PASS verdict -> root done.
+
+    Regression for TWO bugs the live proof caught:
+      1. root-detection used the wrong link direction (loop never fired);
+      2. complete_task's status guard excluded 'review' (PASS root stranded).
+    """
+    from hermes_cli import kanban_govern
+    _enable_loop(monkeypatch)
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="clamp build", triage=True)
+        child_ids = kb.decompose_triage_task(
+            conn, root, root_assignee="architect",
+            children=[
+                {"title": "tests", "assignee": "test-writer"},
+                {"title": "impl", "assignee": "backend-engineer", "parents": [0]},
+                {"title": "docs", "assignee": "doc-writer", "parents": [1]},
+            ],
+        )
+        kanban_govern.record_acceptance(root, ["impl ok", "tests green", "docs present"])
+
+        # Drive the children done in dependency order. recompute_ready runs
+        # inside complete_task and promotes the next one.
+        for cid in child_ids:
+            kb.recompute_ready(conn)
+            kb.complete_task(conn, cid, result=f"{cid} done")
+
+        # All children done -> root must have DIVERTED to review (not ready).
+        kb.recompute_ready(conn)
+        status = conn.execute("SELECT status FROM tasks WHERE id=?", (root,)).fetchone()["status"]
+        assert status == "review", f"root should divert to review, got {status!r}"
+        assert kanban_govern.load_build_state(root)["loop_state"] == "verifying"
+
+        # --- Round 1: FAIL verdict with one correction ---
+        fail = ('{"verdict":"FAIL","summary":"docs missing",'
+                '"criteria":[{"criterion":"docs present","met":false,"evidence":"absent"}],'
+                '"corrections":[{"title":"write docs","body":"create the doc","assignee":"doc-writer"}]}')
+        looped = kb.complete_task(conn, root, result=fail)
+        assert looped is True  # FAIL handled in-loop, root NOT marked done
+        st = kanban_govern.load_build_state(root)
+        assert st["loop_state"] == "correcting" and st["verify_round"] == 1
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (root,)).fetchone()["status"] == "todo"
+        # A corrective child was created and the root waits on it (still the sink).
+        correctives = [r["parent_id"] for r in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id=?", (root,)).fetchall()]
+        new_correctives = [c for c in correctives if c not in child_ids]
+        assert len(new_correctives) == 1
+        assert kb._is_build_root(conn, root) is True
+
+        # --- Complete the correction -> root re-diverts to review ---
+        kb.recompute_ready(conn)
+        kb.complete_task(conn, new_correctives[0], result="docs written")
+        kb.recompute_ready(conn)
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (root,)).fetchone()["status"] == "review"
+        assert kanban_govern.load_build_state(root)["loop_state"] == "verifying"
+
+        # --- Round 2: PASS verdict -> root flips to done ---
+        ok = ('{"verdict":"PASS","summary":"all met",'
+              '"criteria":[{"criterion":"docs present","met":true,"evidence":"present"}],'
+              '"corrections":[]}')
+        # PASS falls through the loop router (returns None) into normal completion;
+        # the 'review' status must be accepted or the root strands.
+        result = kb.complete_task(conn, root, result=ok)
+        assert result is True
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (root,)).fetchone()["status"] == "done"
+        assert kanban_govern.load_build_state(root)["loop_state"] == "done"
+        assert kanban_govern.load_build_state(root)["last_verdict"] == "PASS"
+
+
+def test_orchestrator_loop_off_is_byte_identical_promotion(kanban_home, monkeypatch):
+    """With the loop OFF, a decomposed root promotes todo->ready classically —
+    no divert to review. Guards the flag-gated regression contract."""
+    from hermes_cli import kanban_govern
+    monkeypatch.setattr(kanban_govern, "orchestrator_loop_enabled", lambda: False)
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="loop-off build", triage=True)
+        child_ids = kb.decompose_triage_task(
+            conn, root, root_assignee="architect",
+            children=[{"title": "only child", "assignee": "backend-engineer"}],
+        )
+        kanban_govern.record_acceptance(root, ["done"])
+        for cid in child_ids:
+            kb.recompute_ready(conn)
+            kb.complete_task(conn, cid, result="done")
+        kb.recompute_ready(conn)
+        # Loop OFF -> classic promotion to ready, never review.
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (root,)).fetchone()["status"] == "ready"
