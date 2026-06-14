@@ -13,7 +13,7 @@ Subcommands::
     hermes kanban govern set --secret-scan off # toggle SEC-SECRETS
     hermes kanban govern set --add-protected '**/*.pem'
     hermes kanban govern set --remove-protected '**/*.pem'
-    hermes kanban govern set --hybrid on --profile code-reviewer
+    hermes kanban govern set --hybrid on --for-profile code-reviewer
     hermes kanban govern killswitch on|off     # touch/remove the STOP sentinel
 
 READ is FAIL-SOFT (a missing piece becomes null/empty, never an error) so the
@@ -242,7 +242,27 @@ def _governance_block(name: str) -> Dict[str, Any]:
 
 
 def _hybrid_enabled(name: str) -> bool:
-    """Whether the Ezra-JS Hybrid hooks block is ACTIVE (uncommented) in a profile."""
+    """Whether the Ezra-JS Hybrid is ON for a profile.
+
+    The Hybrid now runs in-process via the factory-governor plugin, gated by
+    ``FACTORY_GOVERNOR_HYBRID=1`` in the profile's ``.env`` (portable — no
+    hardcoded shim path). We also still honour a legacy active ``hooks:`` block
+    for back-compat with an un-migrated setup.
+    """
+    home = _profile_home(name)
+    if home is not None:
+        try:
+            envf = home / ".env"
+            if envf.exists():
+                for ln in envf.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    s = ln.strip()
+                    if s.startswith("FACTORY_GOVERNOR_HYBRID="):
+                        val = s.split("=", 1)[1].strip().strip("'\"").lower()
+                        if val in {"1", "true", "yes", "on"}:
+                            return True
+        except Exception:
+            pass
+    # Legacy: an active hooks: block in config.yaml.
     cp = _profile_config_path(name)
     if cp is None:
         return False
@@ -323,11 +343,24 @@ def _recent_budget_events(board: Optional[str], limit: int = 25) -> List[Dict[st
 
 
 def _recent_builds(limit: int = 25) -> List[Dict[str, Any]]:
-    """Recent factory build records from builds.jsonl, if present."""
-    candidates = [
-        os.environ.get("HERMES_FACTORY_BUILDS"),
-        r"C:\Dev\tools\hermes-update-safety\factory-audit\builds.jsonl",
-    ]
+    """Recent factory build records from builds.jsonl, if present.
+
+    PORTABLE path resolution (no machine-specific path required):
+      1. $HERMES_FACTORY_BUILDS              — explicit override
+      2. <HERMES_HOME>/factory-audit/builds.jsonl  — the portable default
+      3. the legacy C:\\Dev path             — back-compat for the dev box only
+    """
+    candidates = [os.environ.get("HERMES_FACTORY_BUILDS")]
+    try:
+        from hermes_cli.kanban_db import get_hermes_home
+        hh = Path(get_hermes_home())
+        # If we're inside a profile home, climb to the engine root.
+        if hh.parent.name == "profiles":
+            hh = hh.parent.parent
+        candidates.append(str(hh / "factory-audit" / "builds.jsonl"))
+    except Exception:
+        pass
+    candidates.append(r"C:\Dev\tools\hermes-update-safety\factory-audit\builds.jsonl")
     for c in candidates:
         if not c:
             continue
@@ -561,6 +594,34 @@ def _edit_list_item(
     return text
 
 
+def _set_hybrid(on: bool, profiles: List[str]) -> Dict[str, Any]:
+    """Toggle the Ezra-JS Hybrid by writing FACTORY_GOVERNOR_HYBRID to each
+    profile's .env (portable; the in-process plugin reads it). Removes the line
+    when turning off."""
+    changed = []
+    for name in profiles:
+        home = _profile_home(name)
+        if home is None:
+            continue
+        envf = home / ".env"
+        try:
+            lines = (
+                envf.read_text(encoding="utf-8", errors="ignore").splitlines()
+                if envf.exists() else []
+            )
+            lines = [
+                ln for ln in lines
+                if not ln.strip().startswith("FACTORY_GOVERNOR_HYBRID=")
+            ]
+            if on:
+                lines.append("FACTORY_GOVERNOR_HYBRID=1")
+            envf.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            changed.append(name)
+        except Exception:
+            continue
+    return {"ok": bool(changed), "changed": changed, "hybrid": on}
+
+
 def _set_orchestration(key: str, value: Any) -> Dict[str, Any]:
     """Write a kanban orchestration knob to the ROOT config.yaml."""
     try:
@@ -627,8 +688,11 @@ def cmd_govern(args: argparse.Namespace) -> int:
     if sub == "set":
         results = []
         profiles = _factory_profiles()
-        if getattr(args, "profile", None):
-            profiles = [args.profile]
+        # Note: ``--for-profile`` (not ``--profile``) — hermes reserves the
+        # global ``--profile`` / ``-p`` to switch the active profile, so it
+        # never reaches this subparser. ``--for-profile`` scopes the change.
+        if getattr(args, "for_profile", None):
+            profiles = [args.for_profile]
         if getattr(args, "level", None):
             results.append(_set_level(args.level, profiles))
         if getattr(args, "secret_scan", None) is not None:
@@ -638,7 +702,7 @@ def cmd_govern(args: argparse.Namespace) -> int:
         if getattr(args, "remove_protected", None):
             results.append(_edit_protected(None, args.remove_protected, profiles))
         if getattr(args, "hybrid", None) is not None:
-            results.append({"ok": False, "error": "hybrid toggle: edit the profile config.yaml hooks: block (commented=off)", "hint": True})
+            results.append(_set_hybrid(args.hybrid == "on", profiles))
         for key in ("orchestrator_profile", "default_assignee"):
             val = getattr(args, key, None)
             if val is not None:
@@ -692,8 +756,8 @@ def register(subparsers) -> None:
     pset.add_argument("--secret-scan", dest="secret_scan", choices=["on", "off"], help="Toggle SEC-SECRETS scanning")
     pset.add_argument("--add-protected", dest="add_protected", metavar="GLOB", help="Add a protected-path glob")
     pset.add_argument("--remove-protected", dest="remove_protected", metavar="GLOB", help="Remove a protected-path glob")
-    pset.add_argument("--hybrid", choices=["on", "off"], help="Ezra-JS Hybrid (per --profile)")
-    pset.add_argument("--profile", help="Restrict the change to one profile (default: all factory profiles)")
+    pset.add_argument("--hybrid", choices=["on", "off"], help="Ezra-JS Hybrid (per --for-profile)")
+    pset.add_argument("--for-profile", dest="for_profile", help="Restrict the change to one profile (default: all factory profiles). NOT --profile (that's hermes's global active-profile switch).")
     pset.add_argument("--orchestrator-profile", dest="orchestrator_profile", help="Set kanban.orchestrator_profile (root config)")
     pset.add_argument("--default-assignee", dest="default_assignee", help="Set kanban.default_assignee (root config)")
     pset.add_argument("--auto-decompose", dest="auto_decompose", choices=["on", "off"], help="Toggle auto-decompose")

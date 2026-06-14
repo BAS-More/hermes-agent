@@ -90,19 +90,35 @@ function resolveEzraHook() {
 }
 
 // Resolve the dir EZRA should treat as the project root (must contain .ezra/).
-// Priority: $EZRA_PROJECT_DIR (set by the wiring to the build root workspace
-// the native governor seeds) -> $HERMES_KANBAN_WORKSPACE -> payload cwd.
-// Default factory EZRA settings dir (fully /ezra:init-ed; in the backed-up
-// hermes-factory-tooling repo). Used when $EZRA_PROJECT_DIR is unset so the
-// Hybrid works with zero env dependency — the worker .env isn't backed up, so
-// relying on it would silently disable the chain after a profile restore.
-const DEFAULT_EZRA_SETTINGS_DIR =
-  'C:\\Dev\\tools\\hermes-update-safety\\factory-ezra-settings';
+//
+// PORTABLE resolution (no machine-specific paths): the factory EZRA settings
+// live INSIDE HERMES_HOME so they travel with the engine install and work for
+// any user on any PC. Priority:
+//   1. $EZRA_PROJECT_DIR        — explicit override (per-build seed dir)
+//   2. $FACTORY_EZRA_DIR        — explicit override (operator-set)
+//   3. <HERMES_HOME>/factory-ezra-settings  — the portable default
+//   4. the legacy C:\Dev path   — back-compat for the original dev box only
+//   5. $HERMES_KANBAN_WORKSPACE / payload cwd
+// HERMES_HOME is resolved from the env (the engine always sets it for workers);
+// when absent we fall back to the conventional %LOCALAPPDATA%\hermes / ~/.hermes.
+function hermesHome() {
+  const env = process.env.HERMES_HOME;
+  if (env) return env;
+  const local = process.env.LOCALAPPDATA;
+  if (local) return path.join(local, 'hermes');
+  const home = process.env.USERPROFILE || process.env.HOME;
+  return home ? path.join(home, '.hermes') : null;
+}
 
 function resolveProjectDir(payloadCwd) {
+  const hh = hermesHome();
   const candidates = [
     process.env.EZRA_PROJECT_DIR,
-    DEFAULT_EZRA_SETTINGS_DIR,
+    process.env.FACTORY_EZRA_DIR,
+    hh ? path.join(hh, 'factory-ezra-settings') : null,
+    // Legacy dev-box location — kept last so an existing setup still resolves,
+    // but a fresh install uses the portable HERMES_HOME path above.
+    'C:\\Dev\\tools\\hermes-update-safety\\factory-ezra-settings',
     process.env.HERMES_KANBAN_WORKSPACE,
     payloadCwd,
   ];

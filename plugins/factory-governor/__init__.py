@@ -86,6 +86,64 @@ def _evaluate(tool_name: str, args: Any, task_id: str) -> Optional[Dict[str, Any
         return None
 
 
+def _hybrid_enabled() -> bool:
+    """Whether the Ezra-JS Hybrid chain is on (EZRA's SEC/STD/best-practice
+    engine via ezra_shim.js). Opt-in via env so it stays off by default."""
+    return os.environ.get("FACTORY_GOVERNOR_HYBRID", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _ezra_hybrid_block(tool_name: str, args: Any) -> Optional[str]:
+    """Run EZRA's real PreToolUse hooks via the shim, IN-PROCESS and PORTABLY.
+
+    The shim lives next to this file, so it's located by ``__file__``-relative
+    path — no machine-specific path, no shlex/spaces problem (the reason the
+    old config ``hooks:`` command was not portable). Returns a block reason
+    string, or None (allow). Fail-open: any error → None.
+    """
+    if not _hybrid_enabled():
+        return None
+    write_path = None
+    content = None
+    if isinstance(args, dict):
+        write_path = args.get("path") or args.get("file_path")
+        content = (
+            args.get("content") or args.get("new_string")
+            or args.get("file_content") or args.get("patch")
+        )
+    if not write_path or not content:
+        return None
+    try:
+        import json
+        import subprocess
+        shim = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ezra_shim.js")
+        if not os.path.exists(shim):
+            return None
+        payload = {
+            "hook_event_name": "pre_tool_call",
+            "tool_name": tool_name,
+            "tool_input": {"path": write_path, "content": content},
+            "session_id": "",
+            "cwd": os.environ.get("HERMES_KANBAN_WORKSPACE") or os.getcwd(),
+        }
+        r = subprocess.run(
+            ["node", shim],
+            input=json.dumps(payload),
+            capture_output=True, text=True, timeout=10,
+        )
+        out = (r.stdout or "").strip()
+        if not out:
+            return None
+        data = json.loads(out)
+        # Shim emits Claude-Code shape {"decision":"block","reason":...}.
+        if isinstance(data, dict) and data.get("decision") == "block":
+            return data.get("reason") or "EZRA hybrid blocked this write."
+    except Exception as exc:  # fail-open
+        logger.debug("factory-governor: ezra hybrid skipped (allowing): %s", exc)
+    return None
+
+
 def _on_pre_tool_call(
     tool_name: str = "",
     args: Any = None,
@@ -93,20 +151,25 @@ def _on_pre_tool_call(
 ) -> Optional[Dict[str, str]]:
     """Block the write only when the build's oversight level decides 'block'.
 
-    Warn/monitor findings return None here and are surfaced by
-    ``transform_tool_result`` instead (the write proceeds, the model sees the
-    warning next turn) — exactly security-guidance's warn-mode contract.
+    Two layers, native-first: (1) the GOV/SEC governor (kanban_govern), then
+    (2) the optional Ezra-JS Hybrid (EZRA's SEC/STD/best-practice engine via the
+    shim). First block wins. Warn/monitor findings return None here and are
+    surfaced by ``transform_tool_result`` instead.
     """
     res = _evaluate(tool_name, args, _task_id(kwargs))
-    if not res or res.get("decision") != "block":
-        return None
-    return {
-        "action": "block",
-        "message": (
-            res.get("message")
-            or "factory-governor blocked this write (governance policy)."
-        ),
-    }
+    if res and res.get("decision") == "block":
+        return {
+            "action": "block",
+            "message": (
+                res.get("message")
+                or "factory-governor blocked this write (governance policy)."
+            ),
+        }
+    # Native governor allowed it — give the opt-in EZRA hybrid a look.
+    hybrid = _ezra_hybrid_block(tool_name, args)
+    if hybrid:
+        return {"action": "block", "message": hybrid}
+    return None
 
 
 def _on_transform_tool_result(
