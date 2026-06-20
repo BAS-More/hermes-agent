@@ -5744,6 +5744,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 source="cli",
                 exclude_sources=["tool"],
                 limit=limit,
+                order_by_last_active=True,
             )
         except Exception:
             return []

@@ -11822,7 +11822,10 @@ def main():
 
         if action == "list":
             sessions = db.list_sessions_rich(
-                source=args.source, exclude_sources=_exclude, limit=args.limit
+                source=args.source,
+                exclude_sources=_exclude,
+                limit=args.limit,
+                order_by_last_active=True,
             )
             if not sessions:
                 print("No sessions found.")
@@ -11930,7 +11933,10 @@ def main():
             source = getattr(args, "source", None)
             _browse_exclude = None if source else ["tool"]
             sessions = db.list_sessions_rich(
-                source=source, exclude_sources=_browse_exclude, limit=limit
+                source=source,
+                exclude_sources=_browse_exclude,
+                limit=limit,
+                order_by_last_active=True,
             )
             db.close()
             if not sessions:

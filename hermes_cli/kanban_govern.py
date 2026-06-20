@@ -552,12 +552,36 @@ def resolve_emergency_only(workspace: Optional[Path]) -> bool:
     return DEFAULT_EMERGENCY_ONLY
 
 
+def _protected_pattern(entry: Any) -> str:
+    """Extract the glob pattern from one ``protected_paths`` entry.
+
+    Two on-disk schemas exist:
+      * a bare string glob — ``"src/auth/**"``;
+      * a mapping carrying metadata — ``{pattern: "src/auth/**", reason: ...}``
+        (the EZRA governance.yaml format).
+
+    Returns the pattern string, or "" when the entry has no usable pattern.
+    Previously every entry was coerced with ``str(p)``, which turned a mapping
+    into its dict-repr (``"{'pattern': ...}"``) — a string that can never match
+    a real path, silently disabling the GOV-PROTECTED gate for dict-form config.
+    """
+    if isinstance(entry, dict):
+        pat = entry.get("pattern") or entry.get("path") or entry.get("glob")
+        return str(pat) if pat else ""
+    return str(entry) if entry else ""
+
+
 def resolve_protected_paths(workspace: Path) -> List[str]:
-    """Glob patterns the build marks protected (writes need an ACTIVE ADR)."""
+    """Glob patterns the build marks protected (writes need an ACTIVE ADR).
+
+    Handles both schemas: a list of bare string globs, and a list of
+    ``{pattern, reason}`` mappings (EZRA governance.yaml). A lone string is
+    treated as a single pattern.
+    """
     gov = load_governance(workspace)
     pp = gov.get("protected_paths")
     if isinstance(pp, list):
-        return [str(p) for p in pp if p]
+        return [pat for pat in (_protected_pattern(p) for p in pp) if pat]
     if isinstance(pp, str) and pp:
         return [pp]
     return []
