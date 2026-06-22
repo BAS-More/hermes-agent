@@ -276,6 +276,7 @@ from hermes_cli.subcommands.logout import build_logout_parser
 from hermes_cli.subcommands.auth import build_auth_parser
 from hermes_cli.subcommands.status import build_status_parser
 from hermes_cli.subcommands.webhook import build_webhook_parser
+from hermes_cli.subcommands.workspace import build_workspace_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
 from hermes_cli.subcommands.security import build_security_parser
@@ -4081,6 +4082,13 @@ def cmd_webhook(args):
     from hermes_cli.webhook import webhook_command
 
     webhook_command(args)
+
+
+def cmd_workspace(args):
+    """Git safety snapshots — never lose uncommitted work."""
+    from hermes_cli.workspace import workspace_command
+
+    workspace_command(args)
 
 
 def cmd_slack(args):
@@ -9710,6 +9718,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "security",
         "acp",
         "webhook",
+        "workspace",
         "memory",
         "dump",
         "debug",
@@ -10689,7 +10698,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "prompt-size",
         "send", "sessions", "setup",
         "skills", "slack", "status", "tools", "uninstall", "update",
-        "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
+        "version", "webhook", "workspace", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
         # expensive eager import of every bundled plugin module.
@@ -11405,6 +11414,11 @@ def main():
     # webhook command  (parser built in hermes_cli/subcommands/webhook.py)
     # =========================================================================
     build_webhook_parser(subparsers, cmd_webhook=cmd_webhook)
+
+    # =========================================================================
+    # workspace command  (parser built in hermes_cli/subcommands/workspace.py)
+    # =========================================================================
+    build_workspace_parser(subparsers, cmd_workspace=cmd_workspace)
 
     # =========================================================================
     # portal command — Nous Portal status + Tool Gateway routing

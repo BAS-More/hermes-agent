@@ -4084,6 +4084,93 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    # ── Workspace restore (open tabs + per-tab settings) ──
+    #
+    # "Restore my workspace": on app/session close we persist a pointers-only
+    # snapshot of the open tabs and their UI/runtime settings; on next launch
+    # the surface rehydrates it. We store ONLY identifiers + UI metadata
+    # (session ids, tab order, per-tab model/toggles) — never message bodies
+    # (those already live in the messages table) and never secrets/draft text
+    # unless the caller explicitly opts in. The blob is versioned so future
+    # releases can tolerate missing/extra keys (see council synthesis 2026-06).
+    #
+    # Backed by the existing state_meta KV store, so the write is a single
+    # atomic upsert (no new table, no partial-write window). The key is
+    # namespaced per surface ("desktop", "cli", "tui") so each front-end
+    # restores its own layout while sharing session identity.
+
+    WORKSPACE_STATE_VERSION = 1
+    _WORKSPACE_META_PREFIX = "workspace_state:"
+
+    def save_workspace_state(self, surface: str, state: Dict[str, Any]) -> None:
+        """Persist a pointers-only workspace snapshot for ``surface``.
+
+        ``state`` is an arbitrary JSON-serializable dict (e.g.
+        ``{"tabs": [{"session_id": ..., "model": ..., "brain_x2_mode": ...}],
+        "active_tab": 0}``). A ``state_version`` and ``saved_at`` are stamped
+        in automatically. Atomic: single upsert into state_meta.
+
+        Callers MUST exclude message bodies and secrets/draft text from
+        ``state`` unless the user opted into draft restore.
+        """
+        if not surface or not isinstance(surface, str):
+            raise ValueError("surface must be a non-empty string")
+        envelope = {
+            "state_version": self.WORKSPACE_STATE_VERSION,
+            "saved_at": time.time(),
+            "surface": surface,
+            "state": state,
+        }
+        self.set_meta(
+            self._WORKSPACE_META_PREFIX + surface,
+            json.dumps(envelope, ensure_ascii=False),
+        )
+
+    def load_workspace_state(self, surface: str) -> Optional[Dict[str, Any]]:
+        """Return the last saved workspace snapshot for ``surface``.
+
+        Returns the inner ``state`` dict (with ``_state_version`` and
+        ``_saved_at`` attached for the caller's compatibility checks), or
+        ``None`` if nothing was saved or the blob is corrupt/forward-
+        incompatible. Never raises on bad data — a corrupt snapshot must
+        degrade to "start fresh", never crash restore.
+        """
+        if not surface:
+            return None
+        raw = self.get_meta(self._WORKSPACE_META_PREFIX + surface)
+        if not raw:
+            return None
+        try:
+            envelope = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(envelope, dict):
+            return None
+        version = envelope.get("state_version")
+        # Forward-incompatible snapshot (written by a newer Hermes): ignore
+        # rather than guess. Restore degrades to a clean workspace.
+        if isinstance(version, int) and version > self.WORKSPACE_STATE_VERSION:
+            return None
+        state = envelope.get("state")
+        if not isinstance(state, dict):
+            return None
+        # Surface compatibility metadata without colliding with caller keys.
+        state = dict(state)
+        state["_state_version"] = version
+        state["_saved_at"] = envelope.get("saved_at")
+        return state
+
+    def clear_workspace_state(self, surface: str) -> None:
+        """Delete the saved workspace snapshot for ``surface`` (clean start)."""
+        if not surface:
+            return
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM state_meta WHERE key = ?",
+                (self._WORKSPACE_META_PREFIX + surface,),
+            )
+        self._execute_write(_do)
+
     def apply_telegram_topic_migration(self) -> None:
         """Create Telegram DM topic-mode tables on explicit /topic opt-in.
 
