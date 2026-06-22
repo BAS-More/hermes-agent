@@ -930,6 +930,17 @@ DEFAULT_CONFIG = {
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
         "disabled_toolsets": [],
+        # AVI-OS Brain x2 governance mode.
+        #   "fast" (default) — lightweight governance: epistemic tagging,
+        #     output-gate substance checks, scar-tissue learning.  Avi's
+        #     avi-os-brain skill carries the full spec; the prompt injection
+        #     here is a compact always-on reminder.
+        #   "full" — heavyweight Conscience Layer from PROJECT_BRAIN.md:
+        #     mandatory verbatim-quote gates on every substantive output,
+        #     Total Recall + Graphiti pre-check, open-blocker scan, build-ledger
+        #     unit tracking.  Use for high-stakes shipping sessions.
+        #   "off" — no Brain x2 injection (raw model only).
+        "brain_x2_mode": "fast",
     },
     
     "terminal": {
