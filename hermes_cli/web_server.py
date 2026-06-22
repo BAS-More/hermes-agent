@@ -504,6 +504,11 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "description": "API service tier (OpenAI/Anthropic)",
         "options": ["", "auto", "default", "flex"],
     },
+    "agent.brain_x2_mode": {
+        "type": "select",
+        "description": "AVI-OS Brain x2 governance: fast (lightweight) | full (Conscience Layer with verbatim-quote gates) | off",
+        "options": ["fast", "full", "off"],
+    },
     "delegation.reasoning_effort": {
         "type": "select",
         "description": "Reasoning effort for delegated subagents",

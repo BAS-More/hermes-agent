@@ -2178,6 +2178,47 @@ class CLICommandsMixin:
         else:
             _cprint(f"  {_ACCENT}✓ {feature_name} set to {label} (session only){_RST}")
 
+    def _handle_brain_command(self, cmd: str):
+        """Handle /brain — switch Brain x2 governance mode.
+
+        Usage:
+            /brain              Show current mode
+            /brain status       Show current mode
+            /brain fast         Lightweight governance (default)
+            /brain full         Full Conscience Layer (verbatim-quote gates)
+            /brain off          No Brain x2 injection (raw model)
+        """
+        from cli import _ACCENT, _DIM, _RST, _cprint, save_config_value
+        from hermes_cli.config import cfg_get, load_config
+
+        _config = load_config()
+        current = str(cfg_get(_config, "agent", "brain_x2_mode", default="fast")).strip().lower()
+
+        parts = cmd.strip().split(maxsplit=1)
+        if len(parts) < 2 or parts[1].strip().lower() == "status":
+            labels = {"fast": "⚡ fast (lightweight)", "full": "🧠 full (Conscience Layer)", "off": "○ off"}
+            label = labels.get(current, current)
+            _cprint(f"  {_ACCENT}Brain x2 governance: {label}{_RST}")
+            _cprint(f"  {_DIM}Usage: /brain [fast|full|off|status]{_RST}")
+            return
+
+        arg = parts[1].strip().lower()
+        if arg not in {"fast", "full", "off"}:
+            _cprint(f"  {_DIM}(._.) Unknown argument: {arg}{_RST}")
+            _cprint(f"  {_DIM}Valid modes: fast, full, off{_RST}")
+            return
+
+        labels_long = {
+            "fast": "⚡ FAST — lightweight governance (epistemic tagging + output gates)",
+            "full": "🧠 FULL — Conscience Layer (verbatim-quote gates, Total Recall pre-flight, 9-gate ceremony)",
+            "off":  "○ OFF — no governance injection",
+        }
+        self.agent = None  # Force agent re-init with new system prompt
+        if save_config_value("agent.brain_x2_mode", arg):
+            _cprint(f"  {_ACCENT}✓ Brain x2 set to {labels_long[arg]} (saved to config){_RST}")
+        else:
+            _cprint(f"  {_ACCENT}✓ Brain x2 set to {labels_long[arg]} (session only){_RST}")
+
     def _handle_debug_command(self):
         """Handle /debug — upload debug report + logs and print paste URLs."""
         from hermes_cli.debug import run_debug_share

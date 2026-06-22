@@ -7448,6 +7448,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_reasoning_command(cmd_original)
         elif canonical == "fast":
             self._handle_fast_command(cmd_original)
+        elif canonical == "brain":
+            self._handle_brain_command(cmd_original)
         elif canonical == "compress":
             self._manual_compress(cmd_original)
         elif canonical == "usage":

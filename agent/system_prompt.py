@@ -102,6 +102,34 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
+    # AVI-OS Brain x2 governance layer — gated by config.yaml agent.brain_x2_mode.
+    # Three modes:
+    #   "fast"  → compact lightweight guidance (epistemic tagging, output-gate summary)
+    #   "full"  → verbose Conscience Layer with mandatory verbatim-quote gates
+    #   "off"   → no Brain x2 injection
+    # Both modes are injected once at prompt-build time (stable tier) to keep
+    # the prefix cache warm. The "full" mode's verbose ceremony happens at output time.
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        _config = load_config()
+        _brain_x2_mode = cfg_get(_config, "agent", "brain_x2_mode", default="fast")
+        _brain_x2_mode = str(_brain_x2_mode or "fast").strip().lower()
+        # Normalize: YAML may parse "off" as False, "on" as True
+        if _brain_x2_mode in {"false", "no", "0"}:
+            _brain_x2_mode = "off"
+        elif _brain_x2_mode in {"true", "yes", "1", "on"}:
+            _brain_x2_mode = "fast"
+    except Exception:
+        _brain_x2_mode = "fast"
+    
+    if _brain_x2_mode == "full":
+        from agent.prompt_builder import BRAIN_X2_FULL_GUIDANCE
+        stable_parts.append(BRAIN_X2_FULL_GUIDANCE)
+    elif _brain_x2_mode == "fast":
+        from agent.prompt_builder import BRAIN_X2_FAST_GUIDANCE
+        stable_parts.append(BRAIN_X2_FAST_GUIDANCE)
+    # If "off", skip both — no Brain x2 injection
+
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
     # this targets (stopping after a stub; fabricating output when a real
