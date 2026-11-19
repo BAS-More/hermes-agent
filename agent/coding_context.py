@@ -312,7 +312,7 @@ def _resolve_cwd(cwd: Optional[str | Path]) -> Path:
 def _git_root(cwd: Path) -> Optional[Path]:
     current = cwd.resolve()
     for parent in [current, *current.parents]:
-        if (parent / ".git").exists():
+        if (parent / ".git").is_file() or (parent / ".git" / "HEAD").is_file():
             return parent
     return None
 

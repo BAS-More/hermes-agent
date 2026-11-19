@@ -1641,6 +1641,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 event_name = event_type.replace("tool.", "tool.")
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
+        def _dashboard_emit(event: Dict[str, Any]) -> None:
+            """Forward an agent-core dashboard event onto the SSE run stream.
+
+            Receives ``{"type", "payload", "session_id"}`` from the dashboard
+            sink (gateway/dashboard_events.py) and re-enqueues it through the
+            existing ``_enqueue`` machinery, which stamps session_id/run_id/seq
+            and delivers it to connected desktop clients. Threadsafe: ``_enqueue``
+            hops back to the event loop when called from the executor thread.
+            """
+            try:
+                etype = event.get("type")
+                if not etype:
+                    return
+                payload = event.get("payload")
+                if not isinstance(payload, dict):
+                    payload = {} if payload is None else {"value": payload}
+                _enqueue(etype, dict(payload))
+            except Exception:
+                pass
+
         async def _run_and_signal() -> None:
             try:
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
@@ -1654,6 +1674,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
+                    dashboard_emit_callback=_dashboard_emit,
                 )
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -3495,6 +3516,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        dashboard_emit_callback=None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3511,12 +3533,24 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _run():
             from gateway.session_context import clear_session_vars, set_session_vars
+            from gateway.dashboard_events import (
+                clear_dashboard_sink,
+                set_dashboard_sink,
+            )
 
             tokens = set_session_vars(
                 platform="api_server",
                 chat_id=session_id or "",
                 session_key=gateway_session_key or session_id or "",
                 session_id=session_id or "",
+            )
+            # Register the dashboard event sink for THIS executor thread so the
+            # agent core (todo tool, usage, file tools) can emit structured
+            # right-panel events. Set inside _run because contextvars do not
+            # cross the run_in_executor thread boundary (same reason
+            # set_session_vars is called here, not in the parent coroutine).
+            dash_tokens = set_dashboard_sink(
+                dashboard_emit_callback, session_id=session_id or ""
             )
             try:
                 agent = self._create_agent(
@@ -3541,7 +3575,21 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
                     "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
                 }
-                # Include the effective session ID in the result so callers
+                # Emit usage.update for the desktop Usage ring (no-op without a
+                # dashboard client). contextPct = used / context window. Best
+                # effort: if we can't resolve a limit, skip rather than guess.
+                try:
+                    from gateway.dashboard_events import emit_usage_update
+
+                    _ctx_limit = (
+                        getattr(agent, "_config_context_length", None)
+                        or getattr(agent, "context_length", None)
+                    )
+                    _total = usage["total_tokens"]
+                    if _ctx_limit and _total:
+                        emit_usage_update(min(100.0, _total / float(_ctx_limit) * 100.0))
+                except Exception:
+                    pass
                 # (e.g. X-Hermes-Session-Id header) can track compression-
                 # triggered session rotations. (#16938)
                 _eff_sid = getattr(agent, "session_id", session_id)
@@ -3549,6 +3597,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     result["session_id"] = _eff_sid
                 return result, usage
             finally:
+                clear_dashboard_sink(dash_tokens)
                 clear_session_vars(tokens)
 
         return await loop.run_in_executor(None, _run)

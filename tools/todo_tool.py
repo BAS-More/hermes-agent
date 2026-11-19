@@ -93,7 +93,16 @@ class TodoStore:
         # (list order is priority).
         if len(self._items) > MAX_TODO_ITEMS:
             self._items = self._items[:MAX_TODO_ITEMS]
-        return self.read()
+        snapshot = self.read()
+        # Broadcast the full snapshot to the desktop right-panel (no-op when no
+        # dashboard client is connected / headless CLI). Never raises.
+        try:
+            from gateway.dashboard_events import emit_todo_update
+
+            emit_todo_update(snapshot)
+        except Exception:
+            pass
+        return snapshot
 
     def read(self) -> List[Dict[str, str]]:
         """Return a copy of the current list."""
